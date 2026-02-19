@@ -55,6 +55,35 @@ LOCATIONS = {
     "perano head": {"lat": -41.1830, "lon": 174.3160}
 }
 
+# Cook Strait Tide Knowledge - Compass directions for flood (rising) and ebb (falling) tides
+# These are generalized patterns; actual tides vary with specific entrances and times
+TIDE_DIRECTIONS = {
+    # Flood tide (incoming, water level rising) flows generally northeast
+    "flood": {
+        "primary": 45,      # degrees (NE)
+        "range": (0, 90),   # N to E
+        "description": "Flood tide flows northeast into the strait"
+    },
+    # Ebb tide (outgoing, water level falling) flows generally southwest  
+    "ebb": {
+        "primary": 225,     # degrees (SW)
+        "range": (180, 270), # S to W
+        "description": "Ebb tide flows southwest out of the strait"
+    },
+    # Rising water level
+    "rising": {
+        "primary": 45,
+        "range": (0, 90),
+        "description": "Rising tide flows northeast"
+    },
+    # Falling water level
+    "falling": {
+        "primary": 225,
+        "range": (180, 270),
+        "description": "Falling tide flows southwest"
+    }
+}
+
 def fetch_marine_data(location_input, days=2):
     """MetOcean v2 fetcher with DETAILED error logging.
     
@@ -77,6 +106,15 @@ def fetch_marine_data(location_input, days=2):
             print(f"✓ Extracted boat size: {boat_size}m")
         except:
             print(f"⚠️ Could not extract boat size, using default {boat_size}m")
+    
+    # Detect tide state from user input (flood, ebb, rising, falling)
+    tide_state = None
+    query_lower = str(location_input).lower()
+    for state in ["flood", "rising", "ebb", "falling"]:
+        if state in query_lower:
+            tide_state = state
+            print(f"✓ Detected tide state: {state}")
+            break
     
     try:
         api_key = os.getenv("METOCEAN_API_KEY")
@@ -236,12 +274,30 @@ def fetch_marine_data(location_input, days=2):
             # Get wind direction if available
             w_dir = wind_dir[i] if i < len(wind_dir) else None
             
-            # Note: MetOcean API v2 doesn't provide tide direction data
-            # For Cook Strait crossings, tide opposition is determined by local tide tables
-            # This is best checked via manual consultation of tide reports
-            
+            # Detect wind vs tide opposition using local tide knowledge
             opposition_note = ""
             opposition_factor = 1.0
+            
+            if tide_state and w_dir is not None:
+                # Get expected tide direction from local knowledge
+                tide_info = TIDE_DIRECTIONS.get(tide_state)
+                if tide_info:
+                    tide_min, tide_max = tide_info["range"]
+                    
+                    # Check if wind is roughly opposite to tide flow
+                    # Wind opposes tide if it's within 45° of opposite direction
+                    tide_primary = tide_info["primary"]
+                    opposite_dir = (tide_primary + 180) % 360
+                    
+                    # Calculate angle difference (circular)
+                    diff = abs(w_dir - opposite_dir)
+                    if diff > 180:
+                        diff = 360 - diff
+                    
+                    if diff < 45:  # Wind is within 45° of directly opposing tide
+                        opposition_factor = 1.4  # 40% increase in chop
+                        opposition_note = f" ⚠️ WIND OPPOSES {tide_state.upper()} TIDE - Steep seas!"
+                        print(f"  Detected opposition: Wind {w_dir:.0f}° opposes {tide_state} tide (~{tide_primary}°)")
             
             # Boat-size adjusted thresholds
             if boat_size < 6.0:
@@ -311,8 +367,18 @@ def fetch_marine_data(location_input, days=2):
         report += f"   • DANGER: Wind >{danger_wind}kt or Wave >{danger_wave:.1f}m\n"
         report += f"   • NO-GO: Wind >{nogo_wind}kt or Wave >{nogo_wave:.1f}m\n"
         report += f"   • CAUTION: Wind >{caution_wind}kt or Wave >{caution_wave:.1f}m\n"
-        report += f"💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
-        report += f"⚠️ **Check tide tables separately** - Use tide data to assess if wind is opposing incoming/outgoing tide"
+        
+        if tide_state:
+            tide_info = TIDE_DIRECTIONS.get(tide_state)
+            report += f"\n🌊 **Tide State: {tide_state.upper()}**\n"
+            report += f"   {tide_info['description']}\n"
+            report += f"   Opposition factor: 40% increase in effective wave chop\n"
+        else:
+            report += f"\n🌊 **Tide State: Not specified** (mention 'flood', 'ebb', 'rising', or 'falling' for opposition analysis)\n"
+        
+        report += f"\n💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
+        if not tide_state:
+            report += f"💡 **Tip: Mention tide state (flood/ebb/rising/falling) for opposition analysis**"
         
         print(f"✅ SUCCESS - Returning report ({len(report)} chars)")
         print(f"{'='*60}\n")
