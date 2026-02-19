@@ -2,6 +2,7 @@ import os
 import requests
 import urllib3
 import warnings
+import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -29,6 +30,51 @@ except ImportError:
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
+
+# --- API RATE LIMITING & QUOTA PROTECTION ---
+# Track requests to prevent abuse and quota exhaustion
+API_REQUEST_LIMITER = {
+    'metocean': {'last_request': 0, 'min_interval': 2.0},  # Min 2 sec between requests
+    'niwa': {'last_request': 0, 'min_interval': 1.0},      # Min 1 sec between requests
+    'openai': {'request_count': 0, 'limit_per_hour': 20}   # Max 20 requests/hour
+}
+REQUEST_TIMESTAMPS = []  # Track all requests for hourly rate limiting
+
+def check_rate_limit(api_name):
+    """Check if we should throttle the request to protect API quotas.
+    
+    Returns:
+        (allowed: bool, message: str or None)
+    """
+    global API_REQUEST_LIMITER, REQUEST_TIMESTAMPS
+    
+    now = time.time()
+    
+    # Clean up old timestamps (>1 hour)
+    REQUEST_TIMESTAMPS = [ts for ts in REQUEST_TIMESTAMPS if now - ts < 3600]
+    
+    if api_name in ['metocean', 'niwa']:
+        # Min interval throttling
+        limiter = API_REQUEST_LIMITER[api_name]
+        time_since_last = now - limiter['last_request']
+        
+        if time_since_last < limiter['min_interval']:
+            wait_time = limiter['min_interval'] - time_since_last
+            return False, f"⏳ Rate limited (wait {wait_time:.1f}s). Too many rapid requests."
+        
+        limiter['last_request'] = now
+        return True, None
+    
+    elif api_name == 'openai':
+        # Hourly quota limiting
+        if len(REQUEST_TIMESTAMPS) >= API_REQUEST_LIMITER['openai']['limit_per_hour']:
+            return False, (f"⚠️ **Quota Alert:** You've made {len(REQUEST_TIMESTAMPS)} requests in the last hour. "
+                          f"Please wait a moment before making more requests to avoid consuming tokens.")
+        
+        REQUEST_TIMESTAMPS.append(now)
+        return True, None
+    
+    return True, None
 
 def get_secret(key_name):
     """Get a secret from Streamlit Cloud or local .env file.
@@ -287,7 +333,7 @@ def recommend_fishing_locations(wind_data, wave_data, boat_class, boat_size, tid
     
     return recommendation_text
 
-
+def fetch_niwa_tide_data(lat, lon, days=2):
     """Fetch tide data from NIWA Tide API.
     
     Args:
@@ -299,6 +345,11 @@ def recommend_fishing_locations(wind_data, wave_data, boat_class, boat_size, tid
         dict with tide_state, magnitude_factor, description, and raw_data
     """
     try:
+        # CHECK RATE LIMITING BEFORE MAKING REQUEST
+        allowed, _ = check_rate_limit('niwa')
+        if not allowed:
+            return None
+        
         api_key = get_secret("NIWA_API_KEY")
         if not api_key:
             return None
@@ -458,6 +509,11 @@ def fetch_marine_data(location_input, days=2):
         
         now_dt = datetime.now()
         
+        # CHECK RATE LIMITING BEFORE MAKING REQUEST
+        allowed, limit_msg = check_rate_limit('metocean')
+        if not allowed:
+            return limit_msg
+        
         # API PARAMETERS - Enhanced with wind direction (MetOcean doesn't provide tide.direction/level)
         params = {
             "lat": coords['lat'],
@@ -469,7 +525,13 @@ def fetch_marine_data(location_input, days=2):
         
         url = "https://forecast-v2.metoceanapi.com/point/time"
         
-        r = requests.get(url, params=params, headers={"x-api-key": api_key}, verify=False, timeout=15)
+        # Add user-agent to identify this tool and track usage
+        headers = {
+            "x-api-key": api_key,
+            "User-Agent": "CookStraitNavigator/1.0 (Marine Safety Tool)"
+        }
+        
+        r = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
         
         if r.status_code != 200:
             error_text = r.text[:300]
