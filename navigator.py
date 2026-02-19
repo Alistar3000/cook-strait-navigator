@@ -1470,10 +1470,12 @@ Example response structure:
   * Always include safe return timing before conditions deteriorate
 - **For mooring/anchorage queries:**
   * ALWAYS ask for user's current location in the Sounds if not specified (needed for proximity filtering)
+  * ALWAYS call LocalKnowledge tool FIRST to understand wind/sea conditions specific to the area and how different wind directions affect bays
   * Detect multi-day trips using extract_trip_duration patterns ("3 day trip", "3 days", "weekend", "overnight", "4 nights", etc.)
   * For multi-day trips: Fetch extended forecast (3-7 days) and provide DAY-BY-DAY recommendations
   * Analyze how weather CHANGES over the trip duration and recommend mooring movements if needed
-  * Example: "Saturday northerlies → Ship Cove. Sunday steady. Monday southerlies arrive → move to Port Underwood for southerly shelter"
+  * For each bay recommended, explain: What wind direction provides shelter, how that wind creates sea state, any specific hazards from boating guides
+  * Example: "Saturday northerlies → Ship Cove (back bay protected, northerlies funnel through outer Sound creating steep seas outside). Sunday steady. Monday southerlies arrive → move to Port Underwood (opens to north, protected from south)"
   * Always flag if user needs to RELOCATE to a different bay as weather pattern changes
 - When you finish gathering all data, write a final "Thought:" describing what you learned, then ON THE NEXT LINE write "Final Answer:" followed by your complete formatted response
 - The words "Final Answer:" MUST be on their own line, NEVER on the same line as "Thought:"
@@ -1787,19 +1789,24 @@ Question: {input}
 Thought: This is a multi-day trip mooring query. I need to:
 1. Detect it's a 3-day trip
 2. Ask where in the Sounds they'll be based/starting from
-3. Fetch 3-7 day forecast
+3. Fetch 3-7 day forecast showing wind patterns and sea state
 4. Search for mooring locations suitable for their location and weather conditions
-5. Provide day-by-day recommendations accounting for weather changes
+5. Check LocalKnowledge for bay-specific wind/sea conditions (how northerlies/southerlies affect each bay)
+6. Provide day-by-day recommendations accounting for weather changes
 
-First, let me ask for location clarification if not given, and get the forecast.
+Let me start with the forecast.
 Action: WeatherTideAPI
 Action Input: queen charlotte sound, 5
-Observation: [5-day forecast]
-Thought: Got 5-day forecast for QCS. Now I need to search for suitable moorings for their location. Since they didn't specify which area, I should ask OR search broadly. Let me search for location-aware recommendations.
+Observation: [5-day forecast with wind directions and patterns]
+Thought: Got 5-day forecast. Saturday northerlies, Sunday steady, Monday southerly shift. Now let me get bay-specific information about how these wind directions affect anchorages.
+Action: LocalKnowledge
+Action Input: queen charlotte sound northerly southerly shelter wind conditions
+Observation: [wind pattern analysis from boating guides showing how N and S winds affect QCS bays]
+Thought: Excellent - now I understand how each wind direction affects the Sound. Now let me search for mooring locations suitable for the forecast pattern.
 Action: MooringLocations
-Action Input: shelter northerly southerly, 3 day trip queen charlotte sound
-Observation: [list of suitable moorings with shelter info]
-Thought: Now I have the forecast and mooring options. I can provide day-by-day recommendations showing how weather changes affect which bays are suitable over the 3 days.
+Action Input: northerly southerly shelter 3 day trip queen charlotte sound
+Observation: [list of bays with their shelter characteristics for different wind directions]
+Thought: Perfect. I now have: 1) Forecast with wind patterns, 2) Boating guide details on how those winds affect the area, 3) Mooring locations with shelter ratings. I can provide informed day-by-day recommendations.
 
 Final Answer:
 
@@ -1807,68 +1814,76 @@ Final Answer:
 
 **📍 YOUR LOCATION:** Queen Charlotte Sound
 
-**DAY 1 (Saturday):**
+**DAY 1 (Saturday): 12-15kt NORTHERLIES**
 🎯 **Recommended:** Ship Cove
-- Forecast: 12-15kt northerlies, 1m waves
-- Shelter: Excellent protection from N winds
-- Approach: Safe in current conditions
-- Setup notes: Deep water, good holding, DOC facilities
+- **Forecast:** Northerlies 12-15kt (strong gusty flow through outer Sound - from boating guides)
+- **Shelter:** Excellent protection from N winds (back of bay, surrounded by hills)
+- **Sea State:** Northerlies create steep seas outside bay but Ship Cove is deeply recessed and protected
+- **Approach:** Safe to enter in current conditions - enter with caution, avoiding north headland
+- **Setup notes:** Deep water close to shore, good mud holding, DOC facilities
 
-**DAY 2 (Sunday):**
-🎯 **Recommended:** Ship Cove (stay put - excellent in northerlies)
-- Forecast: 10-12kt northerlies easing
-- Continues excellent shelter - no need to move
-- Good day for exploring or shore activities
+**DAY 2 (Sunday): 10-12kt NORTHERLIES EASING**
+🎯 **Recommended:** Ship Cove (stay put - excellent conditions)
+- **Forecast:** Northerlies ease to 10-12kt
+- **Shelter:** Continues excellent protection - no need to move
+- **Sea State:** Swell from previous day eases as wind drops
+- **Best for:** Exploring, shore activities, maintenance
 
-**DAY 3 (Monday):**
-⚠️ **Consider Moving** - Wind shifting to southerly
-- Forecast: 15kt southerlies developing
-- Ship Cove becomes exposed as wind shifts
-- Alternative: Port Underwood or Te Awaiti Bay (both provide southerly shelter)
-- Timing: Suggest moving Sunday evening or early Monday before wind builds
+**DAY 3 (Monday): 15kt SOUTHERLIES DEVELOPING**
+⚠️ **MUST MOVE** - Wind shift makes Ship Cove exposed
+- **Forecast:** Wind shifts to southerly 15kt (ebb to southeasterly pattern per boating guides)
+- **Current Situation:** Ship Cove's open south aspect becomes exposed - southerlies create surge and swell
+- **Recommended Move:** Port Underwood or Te Awaiti Bay (both provide excellent southerly shelter)
+- **Movement Timing:** Sunday 5pm (before darkness, while northerlies still provide protection during transit)
+- **Transit:** 1.5 hours in light conditions
 
 **OVERALL STRATEGY:**
-- Saturday arrival to Ship Cove in northerlies (protected)
-- Sunday: stable conditions - rest/explore
-- Sunday PM: Anticipate southerly arrival - reposition to southerly-protected bay
-- Monday departure in light southerlies from new bay
+- Saturday: Northern exposure suitable for northerlies → Ship Cove ✅
+- Sunday: Hold position, conditions steady → Ship Cove ✅
+- Sunday PM: Anticipate wind shift → Relocate to southerly-protected bay
+- Monday: Depart from new protected anchorage in southerly wind
 
-**MOVEMENT TIMING:**
-- Depart Ship Cove: Sunday 5pm (before darkness, while conditions favor movement)
-- Transit to Port Underwood: 1.5 hours in light winds
-- Setup for Monday: Well before southerly strengthens overnight
+**CRITICAL WIND PATTERN NOTE** (from local boating knowledge):
+Northerlies funnel strongly through outer Sound from N sector. Southerlies are less violent but create surge and swell on southern-exposed shorelines. Spring tide amplifies both patterns.
 
 ---
 
 Example 2: "Where should we anchor tonight with 18kt southerlies?"
 Question: {input}
-Thought: This is an immediate (same-night) mooring recommendation. I need location awareness - where are they currently? If not specified, I should ask. Let me search for southerly-exposed bays.
+Thought: This is an immediate (same-night) mooring recommendation. I need location awareness and wind-specific shelter info. Let me first understand how 18kt southerlies affect the Sounds bays.
+Action: LocalKnowledge
+Action Input: southerly wind 18 knots shelter anchorage Sounds hazards
+Observation: [Boating guide info on how southerlies create conditions, which bays have southern exposure, surge patterns, etc.]
+Thought: Good - now I understand the hazard pattern. Let me search for moorings with southerly protection.
 Action: MooringLocations
-Action Input: shelter from southerly 18 knots tonight
-Observation: [mooring recommendations with southerly shelter]
-Thought: Got options. But I need to know their current location to provide proximity-relevant recommendations. Let me provide options but ask for their location.
+Action Input: shelter from southerly 18 knots anchorage
+Observation: [mooring recommendations with southerly shelter characteristics]
+Thought: Now I have wind pattern info and suitable moorings. I need their location to filter by proximity.
 
 Final Answer:
 
-❓ **QUICK LOCATION QUESTION:** Where are you currently located in the Sounds? (E.g., "Near Tory Channel entrance", "Outer QCS", "Near Ship Cove")
+❓ **QUICK CLARIFICATION:** Where are you currently located in the Sounds? (E.g., "Near Tory Channel entrance", "Outer QCS", "Near Ship Cove")
 
-With 18kt southerlies, here are protected options:
+With **18kt SOUTHERLIES** (creates surge on south-facing shores per boating guides), here are protected options:
 
-✅ **BEST: Port Underwood** (if you can reach it safely)
-- Excellent sheller from southerlies
-- 4-5nm from outer entrance depending on position
-- Good holding, clear approach
+✅ **BEST: Port Underwood** (if you can reach it safely - 4-5nm from outer entrance)
+- Excellent shelter from S/SE wind - bay opens to N/NW
+- Good holding in mud/sand
+- Clear approach, watch for fisheries activity
+- **Wind Effect:** Southerlies diminish significantly once inside port
 
-✅ **GOOD: Te Awaiti Bay**
-- Protected from southerlies
-- Close to Picton if needed
-- Watch for ferry wash
+✅ **GOOD: Te Awaiti Bay** (closer to Picton, 3nm from typical outer positions)
+- Protected from southerlies, opens to north
+- Good holding with pick anchor required (mud with seaweed)
+- **Wind Effect:** Sheltered in southerlies but exposed to ferry wash
+- Shallower than Port Underwood
 
-✅ **ALTERNATIVE: Whekenui Bay** 
-- Less popular, but protected
-- Moderate holding
+✅ **ALTERNATIVE: Whekenui Bay**
+- Protected from southerlies in lee of western shore
+- Less developed but less crowded
+- **Wind Effect:** Good protection from S winds, gets some wind funneling from Cook Strait
 
-**IMPORTANT:** Check your current position first. I can give more specific routing and ETA once you tell me where you are now.
+**CRITICAL CHECK:** Tell me your current position. I can verify safe routing given the wind, check if bays remain accessible in 18kt southerlies, and give you ETA and entry procedures for each option.
 
 Question: {input}
 {agent_scratchpad}"""
