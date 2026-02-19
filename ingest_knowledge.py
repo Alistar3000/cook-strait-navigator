@@ -15,7 +15,8 @@ load_dotenv()
 CHROMA_PATH = "chroma_db"
 KNOWLEDGE_FOLDERS = {
     "maritime": "books",              # Maritime safety PDFs
-    "fishing_reports": "fishing_reports"  # Fishing reports (txt, md, pdf)
+    "fishing_reports": "fishing_reports",  # Fishing reports (txt, md, pdf)
+    "mooring_locations": "mooring_locations"  # Anchorages and moorings in the Sounds
 }
 
 def load_documents_from_folder(folder_path, category):
@@ -95,6 +96,7 @@ def main():
     print(f"\n✅ SUCCESS! Knowledge base created at {CHROMA_PATH}")
     print(f"   📖 Maritime docs: {sum(1 for d in all_docs if d.metadata.get('category') == 'maritime')}")
     print(f"   🎣 Fishing reports: {sum(1 for d in all_docs if d.metadata.get('category') == 'fishing_reports')}")
+    print(f"   ⚓ Mooring locations: {sum(1 for d in all_docs if d.metadata.get('category') == 'mooring_locations')}")
 
 if __name__ == "__main__":
     main()

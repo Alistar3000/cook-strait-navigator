@@ -3,6 +3,7 @@ import requests
 import urllib3
 import warnings
 import time
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -11,6 +12,14 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain.agents import Tool, create_react_agent, AgentExecutor
 from langchain_core.prompts import PromptTemplate
+from mooring_utils import (
+    extract_location_coordinates,
+    parse_location_zone,
+    extract_trip_duration,
+    filter_moorings_by_distance,
+    analyze_mooring_for_weather,
+    generate_multiday_mooring_strategy
+)
 # Import bite times API
 try:
     from bite_times_api import get_bite_times_for_agent
@@ -1160,6 +1169,116 @@ def search_fishing_reports(query):
     except Exception as e:
         return "⚠️ Fishing reports unavailable. Run ingest_knowledge.py to add fishing data."
 
+def search_mooring_locations(query):
+    """
+    Location-aware search for mooring and anchorage information.
+    Supports multi-day trip analysis and proximity filtering.
+    
+    Args:
+        query: Can include location, weather conditions, and trip duration
+               Examples: "sheltered from northerly, 3 day trip"
+               "Ship Cove area, southerly winds"
+    """
+    try:
+        # Extract trip duration if mentioned
+        trip_duration = extract_trip_duration(query)
+        if trip_duration:
+            duration_note = f" for {trip_duration}-day trip"
+        else:
+            duration_note = ""
+        
+        # Parse user location from query
+        user_location, location_name = parse_location_zone(query)
+        
+        vector_db = Chroma(persist_directory="./chroma_db", embedding_function=OpenAIEmbeddings())
+        
+        # Search for mooring/anchorage locations with expanded query
+        search_query = query + " anchorage mooring bay shelter"
+        docs = vector_db.similarity_search(search_query, k=15, filter={"category": "mooring_locations"})
+        
+        if not docs:
+            docs = vector_db.similarity_search(query, k=10)
+        
+        if not docs:
+            return f"❓ I need more location information. Which area of the Sounds are you in or heading to? (e.g., 'Tory Channel', 'Outer QCS', 'Ship Cove area', 'Port Underwood')"
+        
+        # Extract coordinates and build mooring dicts from docs
+        moorings_with_coords = []
+        for doc in docs:
+            mooring_dict = {
+                'name': doc.metadata.get('filename', 'Unknown location'),
+                'content': doc.page_content,
+                'coordinates': extract_location_coordinates(doc.page_content),
+                'distance': None
+            }
+            moorings_with_coords.append(mooring_dict)
+        
+        # Filter by distance if user location is known
+        if user_location:
+            nearby_moorings = filter_moorings_by_distance(
+                moorings_with_coords, 
+                user_location, 
+                max_distance_nm=20.0
+            )
+            
+            # If we have nearby moorings, use them; otherwise use all
+            if nearby_moorings:
+                moorings_display = nearby_moorings[:5]
+            else:
+                moorings_display = [(m, None) for m in moorings_with_coords[:5]]
+        else:
+            moorings_display = [(m, None) for m in moorings_with_coords[:5]]
+        
+        # Build response
+        result = f"⚓ **MOORING & ANCHORAGE RECOMMENDATIONS{duration_note}**\n\n"
+        
+        if user_location:
+            result += f"📍 Based on your location in/near **{location_name}**:\n\n"
+        
+        # Extract weather info from query for suitability analysis
+        wind_direction = ""
+        if "north" in query.lower():
+            wind_direction = "northerly"
+        elif "south" in query.lower():
+            wind_direction = "southerly"
+        elif "east" in query.lower():
+            wind_direction = "easterly"
+        elif "west" in query.lower():
+            wind_direction = "westerly"
+        
+        for i, (mooring, distance) in enumerate(moorings_display, 1):
+            result += f"\n**{i}. {mooring['name']}**"
+            
+            if distance:
+                result += f" ({distance:.1f}nm away)"
+            
+            # Extract key info from content
+            content = mooring['content']
+            lines = content.split('\n')
+            
+            # Get first few lines of description
+            desc_lines = [l.strip() for l in lines[1:4] if l.strip() and not re.match(r'^[A-Z][a-z]+:\s*', l)]
+            if desc_lines:
+                result += f"\n{desc_lines[0][:150]}..."
+            
+            # Look for shelter info
+            if wind_direction and wind_direction.lower() in content.lower():
+                result += f"\n✅ **Shelter:** Good protection from {wind_direction}s"
+            elif "shelter" in content.lower():
+                result += f"\n✅ **Shelter:** Check detailed notes for specific wind directions"
+            
+            # Trip duration note
+            if trip_duration:
+                result += f"\n⏱️ Suitable for {trip_duration}-day stay"
+            
+            result += "\n"
+        
+        result += f"\n💡 **Tip:** Ask for more details about any location (depth, hazards, facilities)"
+        return result
+        
+    except Exception as e:
+        return f"⚠️ Error searching mooring data: {str(e)}. Please ask for a specific location name (e.g., 'Ship Cove', 'Port Underwood') or which area of the Sounds you're in."
+
 def fetch_bite_times_wrapper(days_input):
     """Fetch bite times from fishing.net.nz for fishing recommendations"""
     try:
@@ -1296,6 +1415,29 @@ Workflow:
 Example response structure:
 "Next Wednesday is looking good, with light 8-12kt northerlies and 0.5m waves. There's an ebbing tide starting around 11am. Based on previous fishing reports, Pukerua Bay is productive in these conditions for snapper and kahawai. Soft baits and stray-lining work well there. Be sure to return by 3pm when the wind is forecast to shift southwest and build to 18kt."
 
+**TYPE 5: MOORING/ANCHORAGE RECOMMENDATIONS** (suggesting safe overnight/shelter locations based on weather)
+Examples: "Where should we anchor in the Sounds tonight with northerlies?" or "Best bay to shelter in for tomorrow's southerly?"
+
+Workflow:
+1. Fetch weather forecast for the requested timeframe using WeatherTideAPI
+2. Identify key weather factors:
+   - Wind direction and strength (shelter needed from which direction?)
+   - Wind changes (if overnight, what direction changes occur?)
+   - Wave conditions (if traveling to the bay)
+3. Use MooringLocations tool to search for bays matching the weather conditions:
+   - Query with wind direction (e.g., "sheltered from northerly", "protected southwest")
+   - Query with specific bay names if mentioned
+   - Query with area (e.g., "Queen Charlotte Sound", "Pelorus Sound")
+4. Combine weather analysis + mooring location data:
+   - State the forecast conditions clearly
+   - Recommend bay(s) with appropriate shelter characteristics
+   - Note holding ground quality if available
+   - Include any hazards or approach considerations
+   - If traveling to the bay, specify safe passage times before conditions worsen
+
+Example response structure:
+"With 15-20kt northerlies forecast for tonight easing to 8kt by morning, you'll want shelter from the north. Ship Cove in Queen Charlotte Sound offers excellent protection from northerlies with good holding in mud. The entrance is clear but watch for the shallow patch on the western side. Conditions are safe for the passage now (10kt NW) but will build to 18kt by 2pm, so depart before noon."
+
 🎯 ANALYSIS CHECKLIST:
 - Identify ✅ SAFE periods (wind <15kt, wave <1m)
 - Identify 🟡 CAUTION periods (wind 15-20kt, wave 1-1.5m)
@@ -1326,6 +1468,13 @@ Example response structure:
   * Then query FishingReports with the weather conditions (e.g., "light northerlies ebbing tide")
   * Combine weather + fishing reports to suggest specific locations with species/techniques
   * Always include safe return timing before conditions deteriorate
+- **For mooring/anchorage queries:**
+  * ALWAYS ask for user's current location in the Sounds if not specified (needed for proximity filtering)
+  * Detect multi-day trips using extract_trip_duration patterns ("3 day trip", "3 days", "weekend", "overnight", "4 nights", etc.)
+  * For multi-day trips: Fetch extended forecast (3-7 days) and provide DAY-BY-DAY recommendations
+  * Analyze how weather CHANGES over the trip duration and recommend mooring movements if needed
+  * Example: "Saturday northerlies → Ship Cove. Sunday steady. Monday southerlies arrive → move to Port Underwood for southerly shelter"
+  * Always flag if user needs to RELOCATE to a different bay as weather pattern changes
 - When you finish gathering all data, write a final "Thought:" describing what you learned, then ON THE NEXT LINE write "Final Answer:" followed by your complete formatted response
 - The words "Final Answer:" MUST be on their own line, NEVER on the same line as "Thought:"
 - Format: "Thought: [your final thought]\nFinal Answer:\n\n[your response]"
@@ -1630,6 +1779,97 @@ Final Answer:
 
 **FINAL ADVICE:** [Clear recommendation with timing]
 
+---
+
+**For MOORING/ANCHORAGE RECOMMENDATIONS (with location awareness and multi-day analysis):**
+Example 1: "Best anchorages for a 3-day trip to the Sounds starting Saturday?"
+Question: {input}
+Thought: This is a multi-day trip mooring query. I need to:
+1. Detect it's a 3-day trip
+2. Ask where in the Sounds they'll be based/starting from
+3. Fetch 3-7 day forecast
+4. Search for mooring locations suitable for their location and weather conditions
+5. Provide day-by-day recommendations accounting for weather changes
+
+First, let me ask for location clarification if not given, and get the forecast.
+Action: WeatherTideAPI
+Action Input: queen charlotte sound, 5
+Observation: [5-day forecast]
+Thought: Got 5-day forecast for QCS. Now I need to search for suitable moorings for their location. Since they didn't specify which area, I should ask OR search broadly. Let me search for location-aware recommendations.
+Action: MooringLocations
+Action Input: shelter northerly southerly, 3 day trip queen charlotte sound
+Observation: [list of suitable moorings with shelter info]
+Thought: Now I have the forecast and mooring options. I can provide day-by-day recommendations showing how weather changes affect which bays are suitable over the 3 days.
+
+Final Answer:
+
+**⚓ 3-DAY MOORING STRATEGY: Marlborough Sounds**
+
+**📍 YOUR LOCATION:** Queen Charlotte Sound
+
+**DAY 1 (Saturday):**
+🎯 **Recommended:** Ship Cove
+- Forecast: 12-15kt northerlies, 1m waves
+- Shelter: Excellent protection from N winds
+- Approach: Safe in current conditions
+- Setup notes: Deep water, good holding, DOC facilities
+
+**DAY 2 (Sunday):**
+🎯 **Recommended:** Ship Cove (stay put - excellent in northerlies)
+- Forecast: 10-12kt northerlies easing
+- Continues excellent shelter - no need to move
+- Good day for exploring or shore activities
+
+**DAY 3 (Monday):**
+⚠️ **Consider Moving** - Wind shifting to southerly
+- Forecast: 15kt southerlies developing
+- Ship Cove becomes exposed as wind shifts
+- Alternative: Port Underwood or Te Awaiti Bay (both provide southerly shelter)
+- Timing: Suggest moving Sunday evening or early Monday before wind builds
+
+**OVERALL STRATEGY:**
+- Saturday arrival to Ship Cove in northerlies (protected)
+- Sunday: stable conditions - rest/explore
+- Sunday PM: Anticipate southerly arrival - reposition to southerly-protected bay
+- Monday departure in light southerlies from new bay
+
+**MOVEMENT TIMING:**
+- Depart Ship Cove: Sunday 5pm (before darkness, while conditions favor movement)
+- Transit to Port Underwood: 1.5 hours in light winds
+- Setup for Monday: Well before southerly strengthens overnight
+
+---
+
+Example 2: "Where should we anchor tonight with 18kt southerlies?"
+Question: {input}
+Thought: This is an immediate (same-night) mooring recommendation. I need location awareness - where are they currently? If not specified, I should ask. Let me search for southerly-exposed bays.
+Action: MooringLocations
+Action Input: shelter from southerly 18 knots tonight
+Observation: [mooring recommendations with southerly shelter]
+Thought: Got options. But I need to know their current location to provide proximity-relevant recommendations. Let me provide options but ask for their location.
+
+Final Answer:
+
+❓ **QUICK LOCATION QUESTION:** Where are you currently located in the Sounds? (E.g., "Near Tory Channel entrance", "Outer QCS", "Near Ship Cove")
+
+With 18kt southerlies, here are protected options:
+
+✅ **BEST: Port Underwood** (if you can reach it safely)
+- Excellent sheller from southerlies
+- 4-5nm from outer entrance depending on position
+- Good holding, clear approach
+
+✅ **GOOD: Te Awaiti Bay**
+- Protected from southerlies
+- Close to Picton if needed
+- Watch for ferry wash
+
+✅ **ALTERNATIVE: Whekenui Bay** 
+- Less popular, but protected
+- Moderate holding
+
+**IMPORTANT:** Check your current position first. I can give more specific routing and ETA once you tell me where you are now.
+
 Question: {input}
 {agent_scratchpad}"""
 
@@ -1660,6 +1900,11 @@ Question: {input}
             name="BiteTimesAPI",
             func=fetch_bite_times_wrapper,
             description="Fetch real-time bite times from fishing.net.nz for major and minor feeding windows. Includes sun/moon rise-set times. Use for fishing recommendations to tell users when fish are most active. Input: 'X days' to fetch bite times (e.g., 'next 3 days', 'next 7 days'). References Māori fishing calendar and scientific bite time data."
+        ),
+        Tool(
+            name="MooringLocations",
+            func=search_mooring_locations,
+            description="Search anchorage and mooring information for Marlborough Sounds bays and harbors. Use when users ask about where to anchor/moor or need recommendations for safe overnight stops based on weather conditions. Input: location name OR weather conditions (e.g., 'Queen Charlotte Sound', 'sheltered from northerly', 'Port Underwood'). Returns bay descriptions, shelter characteristics, holding ground, and hazards."
         )
     ]
     
