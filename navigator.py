@@ -766,20 +766,44 @@ def fetch_weather_wrapper(input_str):
     Accepts:
     - "location" (defaults to 2 days)
     - "location, days" (e.g., "mana marina, 7" for 7-day forecast)
+    - Natural language: "location for next week", "location next 3 days", etc.
     
     Validates requests and caps at 10 days (marine forecast reliability limit).
     """
-    parts = [p.strip() for p in str(input_str).split(',')]
-    location = parts[0]
+    input_lower = str(input_str).lower()
+    location = input_str
     days = 2  # default
     requested_days = None
     
-    if len(parts) > 1:
-        try:
-            requested_days = int(parts[1])
-            days = requested_days
-        except ValueError:
-            pass  # keep default
+    # Try to parse natural language time phrases
+    time_phrases = {
+        'next week': 7, 'this week': 7, 'week': 7, '7 days': 7,
+        'next 3 days': 3, 'next three days': 3, '3 days': 3, 'three days': 3,
+        'next 5 days': 5, 'next five days': 5, '5 days': 5, 'five days': 5,
+        'next 10 days': 10, 'next ten days': 10, '10 days': 10, 'ten days': 10,
+        'fortnight': 14, 'next fortnight': 14,
+        'today': 1, 'tomorrow': 1,
+        'weekend': 2, 'next weekend': 2,
+    }
+    
+    for phrase, day_count in time_phrases.items():
+        if phrase in input_lower:
+            requested_days = day_count
+            days = day_count
+            # Remove the time phrase from location string
+            location = input_str.replace(phrase, '', 1).replace(phrase.title(), '', 1).strip(' ,for\t')
+            break
+    
+    # If no natural language match, try comma-separated format
+    if requested_days is None and ',' in str(input_str):
+        parts = [p.strip() for p in str(input_str).split(',')]
+        location = parts[0]
+        if len(parts) > 1:
+            try:
+                requested_days = int(parts[1])
+                days = requested_days
+            except ValueError:
+                pass  # keep default
     
     # If user requested more than 10 days, inform them of the limit
     if requested_days and requested_days > 10:
