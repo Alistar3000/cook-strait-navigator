@@ -111,7 +111,183 @@ TIDE_DIRECTIONS = {
     }
 }
 
-def fetch_niwa_tide_data(lat, lon, days=2):
+# Fishing Location Characteristics - metadata for location recommendations
+LOCATION_CHARACTERISTICS = {
+    # North Island - Wellington
+    "mana marina": {"difficulty": 1, "shelter": "High", "type": "Marina", "protected": True, "best_wind": 15, "best_wave": 0.8},
+    "mana": {"difficulty": 1, "shelter": "High", "type": "Beach/Estuary", "protected": True, "best_wind": 15, "best_wave": 0.8},
+    "plimmerton": {"difficulty": 2, "shelter": "Medium", "type": "Beach", "protected": True, "best_wind": 18, "best_wave": 1.2},
+    "pukerua bay": {"difficulty": 2, "shelter": "Medium", "type": "Beach", "protected": False, "best_wind": 20, "best_wave": 1.5},
+    "titahi bay": {"difficulty": 1, "shelter": "High", "type": "Bay", "protected": True, "best_wind": 15, "best_wave": 0.9},
+    "makara": {"difficulty": 3, "shelter": "Low", "type": "Exposed Beach", "protected": False, "best_wind": 12, "best_wave": 1.0},
+    "karori rock": {"difficulty": 4, "shelter": "Very Low", "type": "Open Water", "protected": False, "best_wind": 10, "best_wave": 0.8},
+    "terawhiti": {"difficulty": 4, "shelter": "Very Low", "type": "Exposed", "protected": False, "best_wind": 8, "best_wave": 0.5},
+    
+    # Sounds - South Island
+    "tory channel": {"difficulty": 3, "shelter": "Medium", "type": "Channel", "protected": True, "best_wind": 18, "best_wave": 1.3},
+    "cape koamaru": {"difficulty": 3, "shelter": "Low", "type": "Headland", "protected": False, "best_wind": 15, "best_wave": 1.1},
+    "ship cove": {"difficulty": 2, "shelter": "Medium", "type": "Cove", "protected": True, "best_wind": 16, "best_wave": 1.0},
+    "motuara island": {"difficulty": 2, "shelter": "Medium", "type": "Island", "protected": False, "best_wind": 16, "best_wave": 1.2},
+}
+
+def get_location_recommendation_score(location_name, wind_kt, wave_m, boat_class, tide_state=None):
+    """Score a location based on current/forecast weather conditions.
+    
+    Args:
+        location_name: Name of the location
+        wind_kt: Wind speed in knots
+        wave_m: Wave height in meters
+        boat_class: Boat class (SMALL, MEDIUM, LARGE)
+        tide_state: Optional tide state (rising/falling/flood/ebb)
+        
+    Returns:
+        dict with score (0-100), reason, and recommendation
+    """
+    if location_name not in LOCATION_CHARACTERISTICS:
+        return {"score": 50, "reason": "Unknown location"}
+    
+    loc = LOCATION_CHARACTERISTICS[location_name]
+    score = 100
+    issues = []
+    positives = []
+    
+    # Set thresholds based on boat class and location difficulty
+    if boat_class == "SMALL":
+        # Small boats need calmer conditions
+        if loc["difficulty"] >= 3:
+            score -= 20
+            issues.append(f"Location too exposed for small boat")
+    elif boat_class == "MEDIUM":
+        if loc["difficulty"] >= 4:
+            score -= 15
+            issues.append("Location exposed for medium boat")
+    # LARGE boats can handle more
+    
+    # Wind scoring
+    best_wind = loc["best_wind"]
+    if wind_kt <= best_wind - 5:
+        positives.append("Light winds - ideal conditions")
+        score += 10
+    elif wind_kt <= best_wind:
+        positives.append("Good wind conditions")
+        score += 5
+    elif wind_kt <= best_wind + 5:
+        score -= 5
+        issues.append(f"Wind slightly above ideal ({wind_kt:.0f}kt vs {best_wind}kt)")
+    elif wind_kt <= best_wind + 10:
+        score -= 15
+        issues.append(f"Wind moderately above ideal")
+    else:
+        score -= 30
+        issues.append(f"Wind too strong for safe fishing")
+    
+    # Wave scoring
+    best_wave = loc["best_wave"]
+    if wave_m <= best_wave - 0.3:
+        positives.append("Calm seas")
+        score += 10
+    elif wave_m <= best_wave:
+        positives.append("Wave height good")
+        score += 5
+    elif wave_m <= best_wave + 0.3:
+        score -= 5
+        issues.append(f"Waves slightly choppy")
+    elif wave_m <= best_wave + 0.6:
+        score -= 15
+        issues.append("Waves moderately choppy")
+    else:
+        score -= 25
+        issues.append("Seas too rough for safe fishing")
+    
+    # Shelter bonus for protected locations
+    if loc["protected"] and wind_kt > 18:
+        positives.append(f"Protected location helps in moderate wind")
+        score += 8
+    
+    # Tide condition bonus
+    if tide_state in ["rising", "flood"]:
+        positives.append("Rising tide - good for fishing")
+        score += 5
+    elif tide_state in ["falling", "ebb"]:
+        issues.append("Falling tide may reduce activity")
+        score -= 3
+    
+    # Clamp score between 0-100
+    score = max(0, min(100, score))
+    
+    reason = ""
+    if positives:
+        reason = ", ".join(positives)
+    if issues:
+        reason += (" | " if reason else "") + " ⚠️ ".join(issues)
+    if not reason:
+        reason = "Average conditions"
+    
+    return {
+        "score": score,
+        "location": location_name,
+        "conditions": f"{wind_kt:.0f}kt wind, {wave_m:.1f}m waves",
+        "reason": reason,
+        "type": loc["type"],
+        "shelter": loc["shelter"]
+    }
+
+def recommend_fishing_locations(wind_data, wave_data, boat_class, boat_size, tide_state=None, tide_info=None, num_recommendations=3):
+    """Recommend best fishing locations based on weather forecast.
+    
+    Args:
+        wind_data: List of wind speeds (knots) forecasted
+        wave_data: List of wave heights (meters) forecasted  
+        boat_class: Boat class (SMALL, MEDIUM, LARGE)
+        boat_size: Boat size in meters
+        tide_state: Optional current tide state
+        tide_info: Optional tide info dict from NIWA
+        num_recommendations: Number of recommendations to return
+        
+    Returns:
+        str with formatted location recommendations
+    """
+    if not wind_data or not wave_data:
+        return ""
+    
+    # Use average conditions from forecast (typically first 3 time points)
+    avg_wind = sum(wind_data[:3]) / len(wind_data[:3]) if wind_data else 0
+    avg_wave = sum(wave_data[:3]) / len(wave_data[:3]) if wave_data else 0
+    
+    # Get tide info for recommendations
+    effective_tide = tide_state
+    if not effective_tide and tide_info and 'tide_state' in tide_info:
+        effective_tide = tide_info['tide_state']
+    
+    # Score all fishing locations
+    scores = []
+    for location_name in LOCATION_CHARACTERISTICS.keys():
+        result = get_location_recommendation_score(
+            location_name, avg_wind, avg_wave, boat_class, effective_tide
+        )
+        scores.append(result)
+    
+    # Sort by score (highest first)
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    
+    # Filter, recommendations - only suggest if score is decent (>40)
+    good_locations = [s for s in scores if s["score"] > 40]
+    
+    if not good_locations:
+        return "\n🎣 **Location Status:** Current conditions challenging for fishing - consider waiting or checking calmer bays (Mana, Titahi}\n"
+    
+    # Format recommendations
+    recommendation_text = "\n🎣 **Recommended Fishing Locations:**\n"
+    
+    for i, loc in enumerate(good_locations[:num_recommendations], 1):
+        score_emoji = "🟢" if loc["score"] > 75 else "🟡" if loc["score"] > 55 else "🟠"
+        recommendation_text += f"{i}. {score_emoji} **{loc['location'].title()}** ({loc['shelter']} shelter, {loc['type']})\n"
+        recommendation_text += f"   Score: {loc['score']:.0f}/100 | {loc['conditions']}\n"
+        recommendation_text += f"   {loc['reason']}\n"
+    
+    return recommendation_text
+
+
     """Fetch tide data from NIWA Tide API.
     
     Args:
@@ -125,7 +301,6 @@ def fetch_niwa_tide_data(lat, lon, days=2):
     try:
         api_key = get_secret("NIWA_API_KEY")
         if not api_key:
-            print("ℹ️ NIWA_API_KEY not configured - using fallback tide analysis")
             return None
         
         # NIWA Tide API endpoint - https://developer.niwa.co.nz/docs/tide-api/1/routes/data/get
@@ -139,19 +314,15 @@ def fetch_niwa_tide_data(lat, lon, days=2):
             "apikey": api_key  # Direct query parameter
         }
         
-        print(f"🌊 Fetching NIWA tide data for {lat}, {lon}")
         r = requests.get(url, params=params, timeout=5, verify=False)
         
         if r.status_code != 200:
-            print(f"ℹ️ NIWA API returned {r.status_code}")
             return None
         
         data = r.json()
-        print(f"✓ NIWA tide data received")
         
         # Parse tide heights to determine state and magnitude
         if "values" not in data or not data["values"]:
-            print("ℹ️ No tide values in NIWA response")
             return None
         
         values = data["values"]
@@ -166,7 +337,6 @@ def fetch_niwa_tide_data(lat, lon, days=2):
                 pass
         
         if len(heights) < 2:
-            print("ℹ️ Insufficient tide data points")
             return None
         
         # Determine if tide is rising or falling (compare first few points)
@@ -198,14 +368,11 @@ def fetch_niwa_tide_data(lat, lon, days=2):
             "raw_heights": heights[:20]
         }
         
-        print(f"✓ Tide Analysis: {magnitude} tide, {tide_trend}, range {tide_range:.2f}m, factor {magnitude_factor}x")
         return result
         
     except requests.exceptions.Timeout:
-        print("ℹ️ NIWA API timeout - using fallback tide analysis")
         return None
     except Exception as e:
-        print(f"ℹ️ Could not fetch NIWA tide data ({type(e).__name__}) - using fallback")
         return None
 
 def fetch_marine_data(location_input, days=2):
@@ -215,21 +382,14 @@ def fetch_marine_data(location_input, days=2):
         location_input: Location name or query (may include vessel info context)
         days: Number of days to forecast (default 2, max 10)
     """
-    print(f"\n{'='*60}")
-    print(f"🔍 FETCH_MARINE_DATA CALLED")
-    print(f"Input: '{location_input}'")
-    print(f"Days: {days}")
-    print(f"{'='*60}")
-    
     # Extract boat_size from context if present (format: "Vessel: 6.5m. ...")
     boat_size = 6.0  # default 6m (medium boat)
     if "Vessel:" in location_input:
         try:
             vessel_part = location_input.split("Vessel:")[1].split("m")[0]
             boat_size = float(vessel_part.strip())
-            print(f"✓ Extracted boat size: {boat_size}m")
         except:
-            print(f"⚠️ Could not extract boat size, using default {boat_size}m")
+            pass
     
     # Detect tide state from user input (flood, ebb, rising, falling)
     tide_state = None
@@ -237,18 +397,15 @@ def fetch_marine_data(location_input, days=2):
     for state in ["flood", "rising", "ebb", "falling"]:
         if state in query_lower:
             tide_state = state
-            print(f"✓ Detected tide state: {state}")
             break
     
     try:
         api_key = get_secret("METOCEAN_API_KEY")
-        print(f"API Key present: {bool(api_key)}")
         
         if not api_key:
             return "❌ ERROR: METOCEAN_API_KEY not found (check Streamlit Secrets)"
         
         query = str(location_input).lower().strip()
-        print(f"Cleaned query: '{query}'")
         
         # Limit days to reasonable range (marine forecasts beyond 10 days are unreliable)
         days = max(1, min(int(days), 10))
@@ -266,11 +423,12 @@ def fetch_marine_data(location_input, days=2):
         if has_tory and not coords:
             coords = LOCATIONS["tory channel"]
             location_name = "Tory Channel (Eastern Entrance)"
-            print(f"✓ Detected entrance: Tory Channel")
+        if has_tory and not coords:
+            coords = LOCATIONS["tory channel"]
+            location_name = "Tory Channel (Eastern Entrance)"
         elif has_koamaru and not coords:
             coords = LOCATIONS["cape koamaru"]
             location_name = "Cape Koamaru (Northern Entrance)"
-            print(f"✓ Detected entrance: Cape Koamaru")
         
         # If user mentions "sounds" or "marlborough" but hasn't specified entrance, ask for clarification
         if not coords and ("sounds" in query or "marlborough" in query):
@@ -283,30 +441,22 @@ def fetch_marine_data(location_input, days=2):
         # Location lookup
         if not coords:
             clean_query = query.replace(" ", "")
-            print(f"Looking up: '{clean_query}'")
             
             if clean_query in LOCATIONS:
                 coords = LOCATIONS[clean_query]
                 location_name = query.title()
-                print(f"✓ Exact match found")
             else:
                 for key, val in LOCATIONS.items():
                     if key in query or query in key:
                         coords = val
                         location_name = key.title()
-                        print(f"✓ Partial match: {key}")
                         break
             
             if not coords:
                 coords = LOCATIONS["cook strait"]
                 location_name = "Cook Strait (Central)"
-                print(f"⚠ Using fallback")
-        
-        print(f"📍 Location: {location_name}")
-        print(f"📍 Coords: {coords}")
         
         now_dt = datetime.now()
-        print(f"⏰ Time: {now_dt}")
         
         # API PARAMETERS - Enhanced with wind direction (MetOcean doesn't provide tide.direction/level)
         params = {
@@ -317,33 +467,22 @@ def fetch_marine_data(location_input, days=2):
             "to": (now_dt + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
         
-        print(f"🌐 API Params: {params}")
-        
         url = "https://forecast-v2.metoceanapi.com/point/time"
-        print(f"🌐 Calling API...")
         
         r = requests.get(url, params=params, headers={"x-api-key": api_key}, verify=False, timeout=15)
         
-        print(f"📡 Response Status: {r.status_code}")
-        print(f"📡 Response Length: {len(r.text)} chars")
-        
         if r.status_code != 200:
             error_text = r.text[:300]
-            print(f"❌ API Error: {error_text}")
             return (f"⚠️ Weather API error {r.status_code}.\n"
                    f"Error: {error_text}\n\n"
                    f"Use WebConsensus to check weather sites.")
         
         data = r.json()
-        print(f"✓ JSON parsed successfully")
-        print(f"✓ Data type: {type(data)}")
-        print(f"✓ Keys: {list(data.keys()) if isinstance(data, dict) else 'NOT A DICT'}")
         
         # Fetch NIWA tide data
         niwa_tide = fetch_niwa_tide_data(coords['lat'], coords['lon'], days=days)
         tide_magnitude_factor = niwa_tide['magnitude_factor'] if niwa_tide else 1.0
         tide_info_str = niwa_tide['description'] if niwa_tide else "Tide data unavailable"
-        print(f"🌊 Tide magnitude factor: {tide_magnitude_factor}x")
         
                 
         if not isinstance(data, dict):
@@ -358,25 +497,12 @@ def fetch_marine_data(location_input, days=2):
         else:
             times = time_dim if isinstance(time_dim, list) else []
         
-        print(f"✓ Variables: {list(variables.keys())}")
-        print(f"✓ Time dimension type: {type(time_dim)}")
-        print(f"✓ Time points: {len(times)}")
-        if times:
-            print(f"✓ First time: {times[0]}")
-        
         wind = variables.get('wind.speed.at-10m', {}).get('data', [])
         wind_dir = variables.get('wind.direction.at-10m', {}).get('data', [])
         wave = variables.get('wave.height', {}).get('data', [])
-        
-        print(f"✓ Wind data points: {len(wind)}")
-        print(f"✓ Wind direction data points: {len(wind_dir)}")
-        print(f"✓ Wave data points: {len(wave)}")
 
         if not wind or not wave:
-            print(f"❌ No data in arrays")
             return f"⚠️ No forecast data for {location_name}."
-        
-        print(f"✓ Building report...")
         
         # Build report
         report = f"═══ {location_name.upper()} ═══\n"
@@ -395,7 +521,7 @@ def fetch_marine_data(location_input, days=2):
             max_display = 80  # ~8 per day for up to 10 days
         
         max_entries = min(len(wind), len(wave), max_display)
-        print(f"✓ Reporting {max_entries} entries")
+        opposition_summary = ""  # Store opposition analysis from first iteration
         
         for i in range(max_entries):
             w_kts = wind[i] * 1.944  # m/s to knots
@@ -404,13 +530,19 @@ def fetch_marine_data(location_input, days=2):
             # Get wind direction if available
             w_dir = wind_dir[i] if i < len(wind_dir) else None
             
-            # Detect wind vs tide opposition using local tide knowledge
+            # Detect wind vs tide opposition using available tide data
             opposition_note = ""
+            opposition_analysis = ""
             opposition_factor = 1.0
             
-            if tide_state and w_dir is not None:
+            # Determine tide state: use user input OR NIWA data
+            effective_tide_state = tide_state
+            if not effective_tide_state and niwa_tide and 'tide_state' in niwa_tide:
+                effective_tide_state = niwa_tide['tide_state']  # 'rising' or 'falling' from NIWA
+            
+            if effective_tide_state and w_dir is not None:
                 # Get expected tide direction from local knowledge
-                tide_info = TIDE_DIRECTIONS.get(tide_state)
+                tide_info = TIDE_DIRECTIONS.get(effective_tide_state)
                 if tide_info:
                     tide_min, tide_max = tide_info["range"]
                     
@@ -424,10 +556,24 @@ def fetch_marine_data(location_input, days=2):
                     if diff > 180:
                         diff = 360 - diff
                     
+                    # Map wind direction to compass point
+                    compass_pts = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+                    compass_idx = int((w_dir + 11.25) / 22.5) % 16
+                    wind_compass = compass_pts[compass_idx]
+                    
+                    tide_direction_name = "Flood (NE)" if effective_tide_state in ["flood", "rising"] else "Ebb (SW)"
+                    
                     if diff < 45:  # Wind is within 45° of directly opposing tide
                         opposition_factor = 1.4  # 40% increase in chop
-                        opposition_note = f" ⚠️ WIND OPPOSES {tide_state.upper()} TIDE - Steep seas!"
-                        print(f"  Detected opposition: Wind {w_dir:.0f}° opposes {tide_state} tide (~{tide_primary}°)")
+                        opposition_note = f" ⚠️ WIND OPPOSES {effective_tide_state.upper()} TIDE - Steep seas!"
+                        opposition_analysis = f"🌊 **Wind/Tide Opposition:** Wind {w_dir:.0f}° ({wind_compass}) opposes {tide_direction_name} → {diff:.0f}° difference - OPPOSITION DETECTED"
+                    else:
+                        # Report even when not opposed (transparency)
+                        opposition_analysis = f"🌊 **Wind/Tide Analysis:** Wind {w_dir:.0f}° ({wind_compass}) vs {tide_direction_name} → {diff:.0f}° difference - Same direction pattern (not opposing)"
+                
+                # Store opposition analysis from first valid iteration
+                if not opposition_summary and opposition_analysis:
+                    opposition_summary = opposition_analysis
             
             # Boat-size adjusted thresholds
             if boat_size < 6.0:
@@ -493,6 +639,10 @@ def fetch_marine_data(location_input, days=2):
             
             report += f"[{time_display}] Wind: {w_kts:.0f}kt{direction_str} | Wave: {wv_m:.1f}m{flag}{opposition_note}\n"
         
+        # Add opposition/wind-tide analysis if available
+        if opposition_summary:
+            report += f"\n{opposition_summary}\n"
+        
         report += f"\n📏 **Vessel Class: {boat_class}** ({boat_size:.1f}m)\n"
         report += f"🚨 Safety Thresholds:\n"
         report += f"   • DANGER: Wind >{danger_wind}kt or Wave >{danger_wave:.1f}m\n"
@@ -505,7 +655,11 @@ def fetch_marine_data(location_input, days=2):
             report += f"   {tide_info['description']}\n"
             report += f"   Opposition factor: 40% increase in effective wave chop\n"
         else:
-            report += f"\n🌊 **Tide State: Not specified** (mention 'flood', 'ebb', 'rising', or 'falling' for opposition analysis)\n"
+            if niwa_tide:
+                report += f"\n🌊 **Tide State: Auto-detected from NIWA data**\n"
+                # Tide state will be shown in opposition_summary if NIWA data is available
+            else:
+                report += f"\n🌊 **Tide State: Not specified** (mention 'flood', 'ebb', 'rising', or 'falling' for analysis)\n"
         
         # Add NIWA tide magnitude info
         if niwa_tide:
@@ -518,22 +672,22 @@ def fetch_marine_data(location_input, days=2):
                 report += f"   ✅ **Neap tide: Calmer conditions**\n"
         
         report += f"\n💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
-        if not tide_state:
-            report += f"💡 **Tip: Mention tide state (flood/ebb/rising/falling) for opposition analysis**"
         
-        print(f"✅ SUCCESS - Returning report ({len(report)} chars)")
-        print(f"{'='*60}\n")
+        # Add location recommendations based on weather conditions
+        location_recs = recommend_fishing_locations(
+            wind, wave, boat_class, boat_size, 
+            tide_state=tide_state,
+            tide_info=niwa_tide,
+            num_recommendations=3
+        )
+        if location_recs:
+            report += location_recs
+        
         return report
         
-    except requests.exceptions.Timeout as e:
-        print(f"❌ TIMEOUT: {e}")
+    except requests.exceptions.Timeout:
         return "⚠️ API timeout. Use WebConsensus."
     except Exception as e:
-        print(f"❌ EXCEPTION TYPE: {type(e).__name__}")
-        print(f"❌ EXCEPTION: {e}")
-        print(f"❌ EXCEPTION STR: '{str(e)}'")
-        import traceback
-        traceback.print_exc()
         return f"⚠️ Error: {type(e).__name__}: {str(e)}\n\nUse WebConsensus tool."
 
 def marine_web_search(query):
