@@ -1334,6 +1334,23 @@ Before doing ANYTHING else, you MUST classify the query type:
 
 ⚠️ CRITICAL: If current query mentions fishing/locations/times/weather WITHOUT being ONLY an entrance name, treat it as type 2-5. NEVER force it to be an entrance-clarification follow-up just because previous conversation mentioned "Sounds".
 
+⏰ TIMEFRAME DETECTION (READ EVERY TIME):
+Every query needs a timeframe. Extract it from these keywords:
+- "next week" or "upcoming week" or "this week" → 7 days
+- "next X days" or "in the next X days" → X days
+- "this weekend" or "coming weekend" → 3 days
+- "couple of nights" WITH "next week" → 7 days (not 2 days!)
+- "a few days" → 3 days
+- "longer trip", "multi-day", "few nights" + week mention → 7 days
+- No timeframe mentioned → 2 days (default)
+**CRITICAL**: When ANY timeframe is mentioned, ALWAYS use extended forecast format "location, days"
+**CRITICAL**: For Cook Strait crossings with timeframes, call WeatherTideAPI with "location, days" format for ALL THREE LOCATIONS (departure, strait, destination)
+Example: If user asks "Can I cross to Koamaru in the next week?":
+  - Extract: timeframe = 7 days
+  - Call: "mana marina, 7" for departure
+  - Call: "cook strait, 7" for central
+  - Call: "koamaru, 7" (or "cape koamaru, 7") for destination
+
 🧠 CONTEXT AWARENESS:
 - Understand the conversation flow: If user previously asked about "the Sounds" and you asked for entrance, the NEXT message is a follow-up only if it's JUST an entrance name
 - If user asks ANY other question (fishing, times, locations, weather), it's a NEW INDEPENDENT QUERY, not a follow-up
@@ -1408,13 +1425,20 @@ Workflow:
       • RECOGNIZE short answers: "Tory", "Tory Channel", "Koamaru", "Cape Koamaru", "Eastern", "Northern" are all valid
 
 Workflow (once entrance is known):
-1. If no departure specified in query, use "mana marina" as default
-2. Check departure location weather
-3. Check Cook Strait central weather
-4. Check specific entrance weather (tory channel OR cape koamaru)
-5. Check destination hazards
-6. Analyze outbound AND return conditions
-7. Calculate safe return window before deterioration
+1. **CRITICAL: Check for timeframe in query** - Words like "next week", "in the next 3 days", "coming days", "upcoming", "this weekend", etc.
+   - "next week" or "upcoming week" → Use 7 days
+   - "next X days" → Use X days
+   - "this weekend" → Use 3 days  
+   - "couple of nights" with "next week" → Use 7 days
+   - No timeframe mentioned → Use default 2 days
+2. If no departure specified in query, use "mana marina" as default
+3. **Call with extended forecast if needed**: Use format "location, days" (e.g., "mana marina, 7" for 7-day forecast)
+4. Check departure location weather for the full timeframe
+5. Check Cook Strait central weather for the full timeframe
+6. Check specific entrance weather for the full timeframe (tory channel OR cape koamaru)
+7. Check destination hazards
+8. Analyze outbound AND return conditions across all days
+9. Identify BEST and WORST days for the timeframe
 
 **TYPE 3: BEST TIME ANALYSIS** (finding optimal windows over multiple days)
 Examples: "When's the best time to go to the Sounds in the next week?" or "Which day is best for fishing at Pukerua Bay in the next 5 days?"
