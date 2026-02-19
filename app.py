@@ -140,7 +140,20 @@ if prompt := st.chat_input("e.g., Is it safe to head to the Sounds this Saturday
             st.session_state.pending_crossing_query = None
 
         # Pass the vessel context directly into the question
-        full_context = f"Vessel: {boat_size}m. VHF: {vhf}. PFDs: {pfd}. Question: {prompt_for_agent}"
+        # Include recent conversation context for follow-up questions
+        conversation_context = ""
+        if len(st.session_state.messages) >= 2:
+            # Get the last assistant message for context (usually contains recommendations)
+            for msg in reversed(st.session_state.messages):
+                if msg["role"] == "assistant":
+                    # Extract key info from last response (dates, times, locations)
+                    last_response = msg["content"]
+                    # Only include if it's a substantial response (not just acknowledgement)
+                    if len(last_response) > 100:
+                        conversation_context = f"\n\n[PREVIOUS CONTEXT: {last_response[:500]}...]"
+                    break
+        
+        full_context = f"Vessel: {boat_size}m. VHF: {vhf}. PFDs: {pfd}. Question: {prompt_for_agent}{conversation_context}"
         
         try:
             # ReAct agents MUST be invoked with a dictionary containing 'input'
