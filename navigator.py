@@ -84,6 +84,103 @@ TIDE_DIRECTIONS = {
     }
 }
 
+def fetch_niwa_tide_data(lat, lon, days=2):
+    """Fetch tide data from NIWA Tide API.
+    
+    Args:
+        lat: Latitude
+        lon: Longitude
+        days: Number of days to forecast
+        
+    Returns:
+        dict with tide_state, magnitude_factor, description, and raw_data
+    """
+    try:
+        api_key = os.getenv("NIWA_API_KEY")
+        if not api_key:
+            print("ℹ️ NIWA_API_KEY not configured - using fallback tide analysis")
+            return None
+        
+        # NIWA Tide API endpoint - https://developer.niwa.co.nz/docs/tide-api/1/routes/data/get
+        url = "https://api.niwa.co.nz/tides/data"
+        
+        # Note: NIWA uses 'long' not 'lon', and numberOfDays parameter
+        params = {
+            "lat": lat,
+            "long": lon,  # IMPORTANT: 'long' not 'lon'
+            "numberOfDays": min(days, 31),  # Max 31 days
+            "apikey": api_key  # Direct query parameter
+        }
+        
+        print(f"🌊 Fetching NIWA tide data for {lat}, {lon}")
+        r = requests.get(url, params=params, timeout=5, verify=False)
+        
+        if r.status_code != 200:
+            print(f"ℹ️ NIWA API returned {r.status_code}")
+            return None
+        
+        data = r.json()
+        print(f"✓ NIWA tide data received")
+        
+        # Parse tide heights to determine state and magnitude
+        if "values" not in data or not data["values"]:
+            print("ℹ️ No tide values in NIWA response")
+            return None
+        
+        values = data["values"]
+        
+        # Extract tide heights from NIWA response
+        heights = []
+        for value in values:
+            try:
+                height = float(value.get("value", 0))
+                heights.append(height)
+            except (ValueError, TypeError):
+                pass
+        
+        if len(heights) < 2:
+            print("ℹ️ Insufficient tide data points")
+            return None
+        
+        # Determine if tide is rising or falling (compare first few points)
+        tide_trend = "rising" if heights[1] > heights[0] else "falling"
+        
+        # Calculate tide range for magnitude (spring vs neap)
+        tide_min = min(heights)
+        tide_max = max(heights)
+        tide_range = tide_max - tide_min
+        
+        # Magnitude factor: spring tide (large range) vs neap tide (small range)
+        # Cook Strait typical range: ~1.5m average, 1.0-2.0m varies
+        if tide_range > 1.5:
+            magnitude = "SPRING"  # Large tidal range
+            magnitude_factor = 1.5  # 50% increase in chop
+        elif tide_range < 0.9:
+            magnitude = "NEAP"    # Small tidal range
+            magnitude_factor = 0.7  # 30% decrease in chop
+        else:
+            magnitude = "NORMAL"
+            magnitude_factor = 1.0
+        
+        result = {
+            "tide_state": tide_trend,
+            "magnitude": magnitude,
+            "magnitude_factor": magnitude_factor,
+            "range": tide_range,
+            "description": f"{magnitude} tide ({tide_trend.upper()}): range {tide_range:.2f}m",
+            "raw_heights": heights[:20]
+        }
+        
+        print(f"✓ Tide Analysis: {magnitude} tide, {tide_trend}, range {tide_range:.2f}m, factor {magnitude_factor}x")
+        return result
+        
+    except requests.exceptions.Timeout:
+        print("ℹ️ NIWA API timeout - using fallback tide analysis")
+        return None
+    except Exception as e:
+        print(f"ℹ️ Could not fetch NIWA tide data ({type(e).__name__}) - using fallback")
+        return None
+
 def fetch_marine_data(location_input, days=2):
     """MetOcean v2 fetcher with DETAILED error logging.
     
@@ -215,6 +312,12 @@ def fetch_marine_data(location_input, days=2):
         print(f"✓ Data type: {type(data)}")
         print(f"✓ Keys: {list(data.keys()) if isinstance(data, dict) else 'NOT A DICT'}")
         
+        # Fetch NIWA tide data
+        niwa_tide = fetch_niwa_tide_data(coords['lat'], coords['lon'], days=days)
+        tide_magnitude_factor = niwa_tide['magnitude_factor'] if niwa_tide else 1.0
+        tide_info_str = niwa_tide['description'] if niwa_tide else "Tide data unavailable"
+        print(f"🌊 Tide magnitude factor: {tide_magnitude_factor}x")
+        
                 
         if not isinstance(data, dict):
             return "⚠️ Invalid data format."
@@ -328,8 +431,9 @@ def fetch_marine_data(location_input, days=2):
                 caution_wave = 1.2
                 boat_class = "LARGE"
             
-            # Effective wave height (will be adjusted if wind opposes tide from external info)
-            effective_wave = wv_m * opposition_factor
+            # Effective wave height accounting for opposition and tide magnitude
+            # Combine: wind opposition (1.4x) × NIWA tide magnitude factor (0.7-1.5x)
+            effective_wave = wv_m * opposition_factor * tide_magnitude_factor
             
             # Safety assessment with boat-size specific thresholds
             if w_kts > danger_wind or effective_wave > danger_wave:
@@ -375,6 +479,16 @@ def fetch_marine_data(location_input, days=2):
             report += f"   Opposition factor: 40% increase in effective wave chop\n"
         else:
             report += f"\n🌊 **Tide State: Not specified** (mention 'flood', 'ebb', 'rising', or 'falling' for opposition analysis)\n"
+        
+        # Add NIWA tide magnitude info
+        if niwa_tide:
+            report += f"\n🌊 **NIWA Tide Data:**\n"
+            report += f"   {niwa_tide['description']}\n"
+            report += f"   Magnitude multiplier: {niwa_tide['magnitude_factor']:.1f}x\n"
+            if niwa_tide['magnitude'] == "SPRING":
+                report += f"   ⚠️ **Spring tide: More chop and current**\n"
+            elif niwa_tide['magnitude'] == "NEAP":
+                report += f"   ✅ **Neap tide: Calmer conditions**\n"
         
         report += f"\n💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
         if not tide_state:

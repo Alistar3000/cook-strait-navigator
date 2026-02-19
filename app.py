@@ -9,7 +9,7 @@ with st.sidebar:
     st.title("🚢 Vessel Profile")
     st.info("Settings here influence the Agent's 'Go/No-Go' logic.")
     
-    boat_size = st.slider("Boat Length (m)", 4.0, 12.0, 6.0, step=0.5)
+    boat_size = st.slider("Boat Length (m)", 4.0, 12.0, 12.0, step=0.5)
     vhf = st.checkbox("VHF Radio Working", value=True)
     pfd = st.checkbox("Lifejackets for all", value=True)
     
