@@ -17,10 +17,37 @@ except ImportError:
     # Fallback if bite_times_api not available
     def get_bite_times_for_agent(location="wellington", days=3):
         return "Bite times API not available. Check https://www.fishing.net.nz/fishing-advice/bite-times/"
+
+# Try to import streamlit for Streamlit Cloud secrets support
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+
 # Suppress warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
+
+def get_secret(key_name):
+    """Get a secret from Streamlit Cloud or local .env file.
+    
+    Args:
+        key_name: Name of the secret (e.g., 'METOCEAN_API_KEY')
+        
+    Returns:
+        The secret value or None if not found
+    """
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    if STREAMLIT_AVAILABLE:
+        try:
+            return st.secrets.get(key_name)
+        except (FileNotFoundError, KeyError, AttributeError):
+            pass
+    
+    # Fallback to environment variable (for local development)
+    return os.getenv(key_name)
 
 # --- 1. COMPREHENSIVE LOCATION DATABASE ---
 LOCATIONS = {
@@ -96,7 +123,7 @@ def fetch_niwa_tide_data(lat, lon, days=2):
         dict with tide_state, magnitude_factor, description, and raw_data
     """
     try:
-        api_key = os.getenv("NIWA_API_KEY")
+        api_key = get_secret("NIWA_API_KEY")
         if not api_key:
             print("ℹ️ NIWA_API_KEY not configured - using fallback tide analysis")
             return None
@@ -214,11 +241,11 @@ def fetch_marine_data(location_input, days=2):
             break
     
     try:
-        api_key = os.getenv("METOCEAN_API_KEY")
+        api_key = get_secret("METOCEAN_API_KEY")
         print(f"API Key present: {bool(api_key)}")
         
         if not api_key:
-            return "❌ ERROR: METOCEAN_API_KEY not found"
+            return "❌ ERROR: METOCEAN_API_KEY not found (check Streamlit Secrets)"
         
         query = str(location_input).lower().strip()
         print(f"Cleaned query: '{query}'")
