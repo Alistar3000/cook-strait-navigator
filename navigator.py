@@ -481,6 +481,14 @@ def fetch_marine_data(location_input, days=2):
             coords = LOCATIONS["cape koamaru"]
             location_name = "Cape Koamaru (Northern Entrance)"
         
+        # If user mentions "cross" or "crossing" the Strait, treat as Sounds crossing
+        if not coords and any(word in query for word in ["cross", "crossing", "cross the strait"]):
+            return ("⚠️ CLARIFICATION NEEDED:\n\n"
+                   "To cross the Cook Strait, which entrance will you use?\n\n"
+                   "1️⃣ TORY CHANNEL (Eastern) - or just say \"Tory\"\n"
+                   "2️⃣ CAPE KOAMARU (Northern) - or just say \"Koamaru\"\n\n"
+                   "❓ Which entrance will you be crossing to?")
+        
         # If user mentions "sounds" or "marlborough" but hasn't specified entrance, ask for clarification
         if not coords and ("sounds" in query or "marlborough" in query):
             return ("⚠️ CLARIFICATION NEEDED:\n\n"
@@ -583,7 +591,11 @@ def fetch_marine_data(location_input, days=2):
             max_display = 80  # ~8 per day for up to 10 days
         
         max_entries = min(len(wind), len(wave), max_display)
-        opposition_summary = ""  # Store opposition analysis from first iteration
+        
+        # Track opposition across ALL forecast periods
+        opposition_events = []  # List of (index, time, wind_dir, opposition_factor)
+        opposition_periods = []  # List of time strings when opposition occurs
+        period_analyses = []  # Detailed analysis for each period
         
         for i in range(max_entries):
             w_kts = wind[i] * 1.944  # m/s to knots
@@ -594,7 +606,7 @@ def fetch_marine_data(location_input, days=2):
             
             # Detect wind vs tide opposition using available tide data
             opposition_note = ""
-            opposition_analysis = ""
+            opposition_has_occurred = False
             opposition_factor = 1.0
             
             # Determine tide state: use user input OR NIWA data
@@ -627,15 +639,39 @@ def fetch_marine_data(location_input, days=2):
                     
                     if diff < 45:  # Wind is within 45° of directly opposing tide
                         opposition_factor = 1.4  # 40% increase in chop
-                        opposition_note = f" ⚠️ WIND OPPOSES {effective_tide_state.upper()} TIDE - Steep seas!"
-                        opposition_analysis = f"🌊 **Wind/Tide Opposition:** Wind {w_dir:.0f}° ({wind_compass}) opposes {tide_direction_name} → {diff:.0f}° difference - OPPOSITION DETECTED"
-                    else:
-                        # Report even when not opposed (transparency)
-                        opposition_analysis = f"🌊 **Wind/Tide Analysis:** Wind {w_dir:.0f}° ({wind_compass}) vs {tide_direction_name} → {diff:.0f}° difference - Same direction pattern (not opposing)"
-                
-                # Store opposition analysis from first valid iteration
-                if not opposition_summary and opposition_analysis:
-                    opposition_summary = opposition_analysis
+                        opposition_note = f" ⚠️ OPPOSES TIDE - Steep seas!"
+                        opposition_has_occurred = True
+                        
+                        # Get time for this period
+                        if i < len(times):
+                            time_str = times[i]
+                            try:
+                                if isinstance(time_str, str):
+                                    dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                                    time_display = dt.strftime('%a %d %H:%M')
+                                else:
+                                    time_display = str(time_str)[:16]
+                            except:
+                                time_display = f"T+{i*3}h"
+                        else:
+                            time_display = f"T+{i*3}h"
+                        
+                        # Check for choppy water potential: tide range > 50cm AND wind > 7kt AND opposition
+                        tide_range = niwa_tide.get('range', 0) if niwa_tide else 0
+                        is_choppy_potential = tide_range > 0.5 and w_kts > 7
+                        
+                        opposition_events.append({
+                            'index': i,
+                            'time': time_display,
+                            'wind_dir': w_dir,
+                            'wind_compass': wind_compass,
+                            'tide_dir': tide_direction_name,
+                            'angle_diff': diff,
+                            'wind_kt': w_kts,
+                            'wave_m': wv_m,
+                            'tide_range': tide_range,
+                            'choppy_potential': is_choppy_potential  # Flagged for choppy water
+                        })
             
             # Boat-size adjusted thresholds
             if boat_size < 6.0:
@@ -701,9 +737,42 @@ def fetch_marine_data(location_input, days=2):
             
             report += f"[{time_display}] Wind: {w_kts:.0f}kt{direction_str} | Wave: {wv_m:.1f}m{flag}{opposition_note}\n"
         
-        # Add opposition/wind-tide analysis if available
+        # Build comprehensive opposition summary from ALL periods
+        opposition_summary = ""
+        choppy_potential_count = 0
+        
+        if opposition_events:
+            opposition_summary = f"\n🌊 **WIND/TIDE OPPOSITION ANALYSIS:**\n"
+            opposition_summary += f"   Opposition detected in {len(opposition_events)} period(s):\n\n"
+            
+            # Separate events by choppy water potential
+            choppy_events = [e for e in opposition_events if e['choppy_potential']]
+            normal_opposition = [e for e in opposition_events if not e['choppy_potential']]
+            
+            # Highlight choppy water potential first
+            if choppy_events:
+                choppy_potential_count = len(choppy_events)
+                opposition_summary += f"   🚨 **CHOPPY WATER POTENTIAL** (Tide > 50cm + Wind > 7kt + Opposition):\n\n"
+                for opp in choppy_events:
+                    opposition_summary += (f"   • [{opp['time']}] ⚠️ CRITICAL CONDITIONS\n"
+                                          f"      Wind: {opp['wind_dir']:.0f}° ({opp['wind_compass']}) opposes {opp['tide_dir']}\n"
+                                          f"      Tide range: {opp['tide_range']:.2f}m | Wind: {opp['wind_kt']:.0f}kt | Wave: {opp['wave_m']:.1f}m\n"
+                                          f"      Angle diff: {opp['angle_diff']:.0f}° | Effect: Steep, choppy seas (40% chop increase)\n\n")
+            
+            # List normal opposition for reference
+            if normal_opposition:
+                opposition_summary += f"   Standard opposition (tide ≤ 50cm or wind ≤ 7kt):\n\n"
+                for opp in normal_opposition:
+                    opposition_summary += (f"   • [{opp['time']}] Wind {opp['wind_dir']:.0f}° ({opp['wind_compass']}) opposes {opp['tide_dir']}\n"
+                                          f"      Tide: {opp['tide_range']:.2f}m | Wind: {opp['wind_kt']:.0f}kt | Wave: {opp['wave_m']:.1f}m\n"
+                                          f"      Angle: {opp['angle_diff']:.0f}° | Effect: Increased chop (40% multiplier)\n\n")
+            
+            opposition_summary += f"   **Summary:** Wind against tide increases effective wave height by ~40%\n"
+            if choppy_potential_count > 0:
+                opposition_summary += f"   ⚠️ **{choppy_potential_count} period(s) with CHOPPY WATER POTENTIAL** - Conditions to avoid\n"
+        
         if opposition_summary:
-            report += f"\n{opposition_summary}\n"
+            report = opposition_summary + "\n" + report
         
         report += f"\n📏 **Vessel Class: {boat_class}** ({boat_size:.1f}m)\n"
         report += f"🚨 Safety Thresholds:\n"
@@ -735,6 +804,66 @@ def fetch_marine_data(location_input, days=2):
         
         report += f"\n💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
         
+        # Add weather pattern analysis from boating guides
+        if wind and wind_dir:
+            avg_wind = sum(wind[:3]) / len(wind[:3]) if wind else 0
+            avg_wind_dir = sum(wind_dir[:3]) / len(wind_dir[:3]) if wind_dir else 0
+            
+            pattern_analysis = analyze_weather_patterns(
+                wind_speed_kt=avg_wind,
+                wind_direction=avg_wind_dir,
+                tide_state=tide_state,
+                location=location_name,
+                boat_size=boat_size
+            )
+            if pattern_analysis:
+                report += f"\n{pattern_analysis}"
+        
+        report += f"\n📏 **Vessel Class: {boat_class}** ({boat_size:.1f}m)\n"
+        report += f"🚨 Safety Thresholds:\n"
+        report += f"   • DANGER: Wind >{danger_wind}kt or Wave >{danger_wave:.1f}m\n"
+        report += f"   • NO-GO: Wind >{nogo_wind}kt or Wave >{nogo_wave:.1f}m\n"
+        report += f"   • CAUTION: Wind >{caution_wind}kt or Wave >{caution_wave:.1f}m\n"
+        
+        if tide_state:
+            tide_info = TIDE_DIRECTIONS.get(tide_state)
+            report += f"\n🌊 **Tide State: {tide_state.upper()}**\n"
+            report += f"   {tide_info['description']}\n"
+            report += f"   Opposition factor: 40% increase in effective wave chop\n"
+        else:
+            if niwa_tide:
+                report += f"\n🌊 **Tide State: Auto-detected from NIWA data**\n"
+                # Tide state will be shown in opposition_summary if NIWA data is available
+            else:
+                report += f"\n🌊 **Tide State: Not specified** (mention 'flood', 'ebb', 'rising', or 'falling' for analysis)\n"
+        
+        # Add NIWA tide magnitude info
+        if niwa_tide:
+            report += f"\n🌊 **NIWA Tide Data:**\n"
+            report += f"   {niwa_tide['description']}\n"
+            report += f"   Magnitude multiplier: {niwa_tide['magnitude_factor']:.1f}x\n"
+            if niwa_tide['magnitude'] == "SPRING":
+                report += f"   ⚠️ **Spring tide: More chop and current**\n"
+            elif niwa_tide['magnitude'] == "NEAP":
+                report += f"   ✅ **Neap tide: Calmer conditions**\n"
+        
+        report += f"\n💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
+        
+        # Add weather pattern analysis from boating guides
+        if wind and wind_dir:
+            avg_wind = sum(wind[:3]) / len(wind[:3]) if wind else 0
+            avg_wind_dir = sum(wind_dir[:3]) / len(wind_dir[:3]) if wind_dir else 0
+            
+            pattern_analysis = analyze_weather_patterns(
+                wind_speed_kt=avg_wind,
+                wind_direction=avg_wind_dir,
+                tide_state=tide_state,
+                location=location_name,
+                boat_size=boat_size
+            )
+            if pattern_analysis:
+                report += f"\n{pattern_analysis}"
+        
         # Add location recommendations based on weather conditions
         location_recs = recommend_fishing_locations(
             wind, wave, boat_class, boat_size, 
@@ -760,6 +889,37 @@ def marine_web_search(query):
            "🌐 **MetService Marine**: https://www.metservice.com/marine/regions/cook-strait\n"
            "🌐 **Yr.no**: https://www.yr.no/en")
 
+def parse_weekend_dates(which_weekend="this"):
+    """Calculate weekend dates including Friday.
+    
+    Args:
+        which_weekend: "this" for coming Friday-Sunday, "next" for the Friday-Sunday after that
+        
+    Returns:
+        (friday, saturday, sunday, days_ahead)
+        - For "this weekend": First Friday from today (including today), plus Sat/Sun
+        - For "next weekend": Skip the first Friday, get the next Friday after that, plus Sat/Sun
+    """
+    today = datetime.now()
+    
+    if which_weekend == "this":
+        # Find first Friday from today (including today)
+        # Friday = 4 (Monday=0, Sunday=6)
+        days_until_friday = (4 - today.weekday()) % 7
+        friday = today + timedelta(days=days_until_friday)
+    else:  # "next" weekend
+        # Find first Friday, then skip it (add 7 days) to get the next Friday
+        days_until_first_friday = (4 - today.weekday()) % 7
+        friday = today + timedelta(days=days_until_first_friday + 7)
+    
+    saturday = friday + timedelta(days=1)
+    sunday = friday + timedelta(days=2)
+    
+    # Calculate days ahead (for forecast length)
+    days_ahead = (sunday - today).days + 1
+    
+    return friday, saturday, sunday, days_ahead
+
 def fetch_weather_wrapper(input_str):
     """Wrapper that handles location and optional days parameter.
     
@@ -767,6 +927,7 @@ def fetch_weather_wrapper(input_str):
     - "location" (defaults to 2 days)
     - "location, days" (e.g., "mana marina, 7" for 7-day forecast)
     - Natural language: "location for next week", "location next 3 days", etc.
+    - "location this weekend" / "location next weekend" (calculates actual Fri+Sat+Sun dates)
     
     Validates requests and caps at 10 days (marine forecast reliability limit).
     """
@@ -774,25 +935,50 @@ def fetch_weather_wrapper(input_str):
     location = input_str
     days = 2  # default
     requested_days = None
+    weekend_context = None
     
-    # Try to parse natural language time phrases
-    time_phrases = {
-        'next week': 7, 'this week': 7, 'week': 7, '7 days': 7,
-        'next 3 days': 3, 'next three days': 3, '3 days': 3, 'three days': 3,
-        'next 5 days': 5, 'next five days': 5, '5 days': 5, 'five days': 5,
-        'next 10 days': 10, 'next ten days': 10, '10 days': 10, 'ten days': 10,
-        'fortnight': 14, 'next fortnight': 14,
-        'today': 1, 'tomorrow': 1,
-        'weekend': 2, 'next weekend': 2,
-    }
+    # Handle "this weekend" specially to get proper Friday + Saturday + Sunday dates
+    if 'this weekend' in input_lower:
+        friday, saturday, sunday, days_needed = parse_weekend_dates('this')
+        requested_days = days_needed
+        days = days_needed
+        weekend_context = f"(Friday {friday.strftime('%d %b')} – Sunday {sunday.strftime('%d %b')})"
+        # Remove weekend phrases from location string
+        location = input_lower.replace('this weekend', '', 1).replace('weekend', '', 1).strip(' ,for\t')
+    # Handle "next weekend" separately to get the following Friday-Sunday
+    elif 'next weekend' in input_lower:
+        friday, saturday, sunday, days_needed = parse_weekend_dates('next')
+        requested_days = days_needed
+        days = days_needed
+        weekend_context = f"(Friday {friday.strftime('%d %b')} – Sunday {sunday.strftime('%d %b')})"
+        # Remove weekend phrases from location string
+        location = input_lower.replace('next weekend', '', 1).replace('weekend', '', 1).strip(' ,for\t')
+    elif 'weekend' in input_lower:
+        # Handle just "weekend" as this coming weekend
+        friday, saturday, sunday, days_needed = parse_weekend_dates('this')
+        requested_days = days_needed
+        days = days_needed
+        weekend_context = f"(Friday {friday.strftime('%d %b')} – Sunday {sunday.strftime('%d %b')})"
+        location = input_lower.replace('weekend', '', 1).strip(' ,for\t')
     
-    for phrase, day_count in time_phrases.items():
-        if phrase in input_lower:
-            requested_days = day_count
-            days = day_count
-            # Remove the time phrase from location string
-            location = input_str.replace(phrase, '', 1).replace(phrase.title(), '', 1).strip(' ,for\t')
-            break
+    # Try other time phrases if not weekend
+    if requested_days is None:
+        time_phrases = {
+            'next week': 7, 'this week': 7, 'week': 7, '7 days': 7,
+            'next 3 days': 3, 'next three days': 3, '3 days': 3, 'three days': 3,
+            'next 5 days': 5, 'next five days': 5, '5 days': 5, 'five days': 5,
+            'next 10 days': 10, 'next ten days': 10, '10 days': 10, 'ten days': 10,
+            'fortnight': 14, 'next fortnight': 14,
+            'today': 1, 'tomorrow': 1,
+        }
+        
+        for phrase, day_count in time_phrases.items():
+            if phrase in input_lower:
+                requested_days = day_count
+                days = day_count
+                # Remove the time phrase from location string
+                location = input_str.replace(phrase, '', 1).replace(phrase.title(), '', 1).strip(' ,for\t')
+                break
     
     # If no natural language match, try comma-separated format
     if requested_days is None and ',' in str(input_str):
@@ -812,32 +998,143 @@ def fetch_weather_wrapper(input_str):
                 f"beyond 10 days are generally unreliable due to rapidly changing conditions. "
                 f"Showing 10-day forecast instead.\n\n{result}")
     
-    return fetch_marine_data(location, days)
+    result = fetch_marine_data(location, days)
+    # Add weekend context to result if applicable
+    if weekend_context:
+        result = f"📅 **{weekend_context}**\n\n{result}"
+    return result
 
 def search_books(query):
-    """Search maritime PDFs for hazards and local knowledge."""
+    """Search maritime PDFs for hazards, local knowledge, and safety guidelines.
+    
+    Comprehensive search across Cook Strait Boating Guides and Cockpit Guide
+    for location-specific hazards, tidal information, weather effects, and safety advice.
+    """
     try:
         vector_db = Chroma(persist_directory="./chroma_db", embedding_function=OpenAIEmbeddings())
-        # Filter for maritime category if available
-        docs = vector_db.similarity_search(query, k=3, filter={"category": "maritime"})
         
-        # Fallback if no category filter results
-        if not docs:
-            docs = vector_db.similarity_search(query, k=3)
+        # Build comprehensive search queries for safety assessment
+        search_queries = [
+            query,  # Original query
+            f"{query} hazards rocks rips tides currents",
+            f"{query} safety conditions weather patterns wind",
+            f"Cook Strait {query} boating guide conditions",
+            f"{query} crossing dangers opposition tide"
+        ]
         
-        if not docs:
-            return "No local hazard information found."
+        all_docs = []
+        for search_query in search_queries:
+            try:
+                # Try with maritime category filter
+                docs = vector_db.similarity_search(search_query, k=2, filter={"category": "maritime"})
+                if not docs:
+                    # Fallback without filter
+                    docs = vector_db.similarity_search(search_query, k=2)
+                all_docs.extend(docs)
+            except:
+                # Silently skip if search fails
+                pass
         
-        result = "═══ LOCAL MARITIME KNOWLEDGE ═══\n\n"
-        for i, doc in enumerate(docs, 1):
-            source = doc.metadata.get('source', 'Unknown')
+        if not all_docs:
+            return "ℹ️ No detailed guidance available for this location."
+        
+        # Remove duplicates
+        seen = set()
+        unique_docs = []
+        for doc in all_docs:
+            content = doc.page_content
+            if content not in seen:
+                seen.add(content)
+                unique_docs.append(doc)
+        
+        # Format results
+        result = "═══ SAFETY & LOCAL KNOWLEDGE (from Boating Guides) ═══\n\n"
+        for i, doc in enumerate(unique_docs[:5], 1):  # Top 5 most relevant
+            source = doc.metadata.get('filename', 'Guide').replace('.pdf', '')
             page = doc.metadata.get('page', '?')
-            content = doc.page_content[:300].strip()
-            result += f"📖 {source} (p.{page})\n{content}...\n\n"
+            content = doc.page_content[:280].strip()
+            # Clean up whitespace
+            content = ' '.join(content.split())
+            result += f"{i}. [{source}] {content}...\n\n"
         
         return result
     except Exception as e:
-        return "⚠️ Knowledge base unavailable."
+        return "ℹ️ Knowledge base temporarily unavailable."
+
+def analyze_weather_patterns(wind_speed_kt, wind_direction, tide_state, location, boat_size):
+    """Use boating guide knowledge to analyze how weather patterns affect water conditions.
+    
+    This function searches the Cook Strait Boating Guides and Cockpit Guide for
+    information about how specific wind patterns and tide states create water conditions.
+    
+    Args:
+        wind_speed_kt: Wind speed in knots
+        wind_direction: Wind direction in degrees (0-360, 0=N, 90=E, 180=S, 270=W)
+        tide_state: Tide state if known (flood, ebb, rising, falling) or None
+        location: Location name
+        boat_size: Boat size in meters
+        
+    Returns:
+        str with detailed weather pattern analysis from boating guides
+    """
+    try:
+        vector_db = Chroma(persist_directory="./chroma_db", embedding_function=OpenAIEmbeddings())
+        
+        # Convert wind direction to compass direction
+        compass_dirs = ["northerlies", "NNE", "northeasterlies", "ENE", 
+                       "easterlies", "ESE", "southeasterlies", "SSE",
+                       "southerlies", "SSW", "southwesterlies", "WSW", 
+                       "westerlies", "WNW", "northwesterlies", "NNW"]
+        compass_idx = int((wind_direction + 11.25) / 22.5) % 16
+        wind_dir_name = compass_dirs[compass_idx]
+        
+        # Build a comprehensive query about this specific weather pattern
+        queries = [
+            f"{wind_dir_name} wind {wind_speed_kt} knots Cook Strait {location}",
+            f"weather patterns wind direction sea state chop {wind_dir_name}",
+            f"wind tide opposition steep seas safety {tide_state}",
+            f"boating conditions {location} northerlies southerlies exposed areas",
+            f"Cook Strait Boating Guide weather seasonal conditions hazards"
+        ]
+        
+        # Gather insights from multiple angle searches
+        all_docs = []
+        for query in queries:
+            try:
+                docs = vector_db.similarity_search(query, k=2, filter={"category": "maritime"})
+                all_docs.extend(docs)
+            except:
+                try:
+                    docs = vector_db.similarity_search(query, k=2)
+                    all_docs.extend(docs)
+                except:
+                    pass
+        
+        if not all_docs:
+            return ""
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_docs = []
+        for doc in all_docs:
+            content = doc.page_content
+            if content not in seen:
+                seen.add(content)
+                unique_docs.append(doc)
+        
+        # Format the analysis
+        result = "🌊 **WEATHER PATTERN ANALYSIS (from Boating Guides):**\n\n"
+        for i, doc in enumerate(unique_docs[:4], 1):  # Top 4 most relevant
+            source = doc.metadata.get('filename', 'Guide').replace('.pdf', '')
+            content = doc.page_content[:250].strip()
+            # Clean up content to remove page breaks and excess whitespace
+            content = ' '.join(content.split())
+            result += f"• {content}\n\n"
+        
+        return result
+        
+    except Exception as e:
+        return ""
 
 def search_fishing_reports(query):
     """Search fishing reports for species, techniques, conditions, and local fishing knowledge."""
@@ -1032,6 +1329,18 @@ Example response structure:
 - When you finish gathering all data, write a final "Thought:" describing what you learned, then ON THE NEXT LINE write "Final Answer:" followed by your complete formatted response
 - The words "Final Answer:" MUST be on their own line, NEVER on the same line as "Thought:"
 - Format: "Thought: [your final thought]\nFinal Answer:\n\n[your response]"
+
+📚 **USING BOATING GUIDES FOR SAFETY ASSESSMENT:**
+For ANY weather check (local trips, crossings, best time analysis):
+1. **ALWAYS** use LocalKnowledge tool to search for boating guide insights about the location
+2. The weather forecast includes **WEATHER PATTERN ANALYSIS** (from Cook Strait Boating Guide 1 & 2 and Cockpit Guide) showing how that specific wind direction and speed affects water conditions
+3. Use this pattern analysis alongside raw forecast data - it's not just wind speed and wave height, but HOW different wind patterns create dangerous conditions
+   - E.g., northerlies may create different chop patterns than southerlies in the same location
+   - Tide running against wind creates steeper, more dangerous seas
+   - Spring tides amplify effects, neap tides reduce them
+4. When analyzing Cook Strait crossings, reference the hazard information for opposition conditions, tidal races, and entrance-specific dangers
+5. Combine weather patterns + boating guide knowledge + actual forecast to provide nuanced safety advice
+   - Don't just say "wind is 15kt" - explain what that means in context of the location's specific geography and weather patterns
 
 Available tools:
 {tools}
