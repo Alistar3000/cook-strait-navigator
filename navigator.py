@@ -146,11 +146,11 @@ def fetch_marine_data(location_input, days=2):
         now_dt = datetime.now()
         print(f"⏰ Time: {now_dt}")
         
-        # API PARAMETERS - Enhanced with wind direction and tide data
+        # API PARAMETERS - Enhanced with wind direction (MetOcean doesn't provide tide.direction/level)
         params = {
             "lat": coords['lat'],
             "lon": coords['lon'],
-            "variables": "wind.speed.at-10m,wind.direction.at-10m,wave.height,tide.level,tide.direction",
+            "variables": "wind.speed.at-10m,wind.direction.at-10m,wave.height",
             "from": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to": (now_dt + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
@@ -199,14 +199,10 @@ def fetch_marine_data(location_input, days=2):
         wind = variables.get('wind.speed.at-10m', {}).get('data', [])
         wind_dir = variables.get('wind.direction.at-10m', {}).get('data', [])
         wave = variables.get('wave.height', {}).get('data', [])
-        tide_level = variables.get('tide.level', {}).get('data', [])
-        tide_dir = variables.get('tide.direction', {}).get('data', [])
         
         print(f"✓ Wind data points: {len(wind)}")
         print(f"✓ Wind direction data points: {len(wind_dir)}")
         print(f"✓ Wave data points: {len(wave)}")
-        print(f"✓ Tide level data points: {len(tide_level)}")
-        print(f"✓ Tide direction data points: {len(tide_dir)}")
 
         if not wind or not wave:
             print(f"❌ No data in arrays")
@@ -237,52 +233,15 @@ def fetch_marine_data(location_input, days=2):
             w_kts = wind[i] * 1.944  # m/s to knots
             wv_m = wave[i]
             
-            # Get wind direction and tide info if available
+            # Get wind direction if available
             w_dir = wind_dir[i] if i < len(wind_dir) else None
-            t_level = tide_level[i] if i < len(tide_level) else None
-            t_dir_raw = tide_dir[i] if i < len(tide_dir) else None
             
-            # Detect wind vs tide opposition (creates steeper, choppier seas)
-            wind_opposes_tide = False
-            opposition_factor = 1.0
+            # Note: MetOcean API v2 doesn't provide tide direction data
+            # For Cook Strait crossings, tide opposition is determined by local tide tables
+            # This is best checked via manual consultation of tide reports
+            
             opposition_note = ""
-            
-            if w_dir is not None and t_dir_raw is not None:
-                # Handle tide direction (could be string like "FLOOD"/"EBB" or degrees)
-                try:
-                    # Map common tide directions to degrees (simplified)
-                    tide_deg_map = {
-                        "flood": 0, "flowing_in": 0, "in": 0,
-                        "ebb": 180, "flowing_out": 180, "out": 180,
-                        "north": 0, "south": 180, "east": 90, "west": 270
-                    }
-                    
-                    t_dir = None
-                    if isinstance(t_dir_raw, str):
-                        t_dir_str = str(t_dir_raw).lower()
-                        t_dir = tide_deg_map.get(t_dir_str, None)
-                    else:
-                        try:
-                            t_dir = float(t_dir_raw)
-                        except:
-                            pass
-                    
-                    if t_dir is not None:
-                        # Check if wind opposes tide (within 45 degrees of opposite directions)
-                        angle_diff = abs(float(w_dir) - t_dir)
-                        # Account for circular nature (e.g., 350 vs 10 = 20 degrees apart)
-                        if angle_diff > 180:
-                            angle_diff = 360 - angle_diff
-                        
-                        if angle_diff < 45 or angle_diff > 315:  # 0-45 or 315-360
-                            wind_opposes_tide = True
-                            opposition_factor = 1.4  # 40% increase in effective chop
-                            opposition_note = " ⚠️ Wind-tide opposition creates steep seas!"
-                except Exception as e:
-                    print(f"⚠️ Could not parse tide direction: {e}")
-            
-            # Effective wave height considering opposition
-            effective_wave = wv_m * opposition_factor
+            opposition_factor = 1.0
             
             # Boat-size adjusted thresholds
             if boat_size < 6.0:
@@ -313,6 +272,9 @@ def fetch_marine_data(location_input, days=2):
                 caution_wave = 1.2
                 boat_class = "LARGE"
             
+            # Effective wave height (will be adjusted if wind opposes tide from external info)
+            effective_wave = wv_m * opposition_factor
+            
             # Safety assessment with boat-size specific thresholds
             if w_kts > danger_wind or effective_wave > danger_wave:
                 flag = " 🔴 DANGER"
@@ -323,7 +285,7 @@ def fetch_marine_data(location_input, days=2):
             else:
                 flag = " ✅ SAFE"
             
-            # FIXED: Time formatting - handle list index properly
+            # Time formatting
             if i < len(times):
                 time_str = times[i]
                 try:
@@ -335,25 +297,22 @@ def fetch_marine_data(location_input, days=2):
                 except:
                     time_display = f"T+{i*3}h"
             else:
-                # Fallback if no time available
                 time_display = f"T+{i*3}h"
             
-            # Build forecast line with directional info if available
+            # Build forecast line with wind direction if available
             direction_str = ""
             if w_dir is not None:
                 direction_str = f" {int(w_dir)}°"
             
-            report += f"[{time_display}] Wind: {w_kts:.0f}kt{direction_str} | Wave: {wv_m:.1f}m (eff: {effective_wave:.1f}m){flag}"
-            if opposition_note:
-                report += opposition_note
-            report += "\n"
+            report += f"[{time_display}] Wind: {w_kts:.0f}kt{direction_str} | Wave: {wv_m:.1f}m{flag}{opposition_note}\n"
         
         report += f"\n📏 **Vessel Class: {boat_class}** ({boat_size:.1f}m)\n"
         report += f"🚨 Safety Thresholds:\n"
         report += f"   • DANGER: Wind >{danger_wind}kt or Wave >{danger_wave:.1f}m\n"
         report += f"   • NO-GO: Wind >{nogo_wind}kt or Wave >{nogo_wave:.1f}m\n"
         report += f"   • CAUTION: Wind >{caution_wind}kt or Wave >{caution_wave:.1f}m\n"
-        report += f"⚠️ **Wind opposing tide increases wave chop by 40%** (shown in 'eff:' value)"
+        report += f"💡 **Wind directions shown (0°=N, 90°=E, 180°=S, 270°=W)**\n"
+        report += f"⚠️ **Check tide tables separately** - Use tide data to assess if wind is opposing incoming/outgoing tide"
         
         print(f"✅ SUCCESS - Returning report ({len(report)} chars)")
         print(f"{'='*60}\n")
