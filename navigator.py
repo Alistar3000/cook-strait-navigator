@@ -59,7 +59,7 @@ def fetch_marine_data(location_input, days=2):
     """MetOcean v2 fetcher with DETAILED error logging.
     
     Args:
-        location_input: Location name or query
+        location_input: Location name or query (may include vessel info context)
         days: Number of days to forecast (default 2, max 10)
     """
     print(f"\n{'='*60}")
@@ -67,6 +67,16 @@ def fetch_marine_data(location_input, days=2):
     print(f"Input: '{location_input}'")
     print(f"Days: {days}")
     print(f"{'='*60}")
+    
+    # Extract boat_size from context if present (format: "Vessel: 6.5m. ...")
+    boat_size = 6.0  # default 6m (medium boat)
+    if "Vessel:" in location_input:
+        try:
+            vessel_part = location_input.split("Vessel:")[1].split("m")[0]
+            boat_size = float(vessel_part.strip())
+            print(f"✓ Extracted boat size: {boat_size}m")
+        except:
+            print(f"⚠️ Could not extract boat size, using default {boat_size}m")
     
     try:
         api_key = os.getenv("METOCEAN_API_KEY")
@@ -136,11 +146,11 @@ def fetch_marine_data(location_input, days=2):
         now_dt = datetime.now()
         print(f"⏰ Time: {now_dt}")
         
-        # API PARAMETERS
+        # API PARAMETERS - Enhanced with wind direction and tide data
         params = {
             "lat": coords['lat'],
             "lon": coords['lon'],
-            "variables": "wind.speed.at-10m,wave.height",
+            "variables": "wind.speed.at-10m,wind.direction.at-10m,wave.height,tide.level,tide.direction",
             "from": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to": (now_dt + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
@@ -187,10 +197,16 @@ def fetch_marine_data(location_input, days=2):
             print(f"✓ First time: {times[0]}")
         
         wind = variables.get('wind.speed.at-10m', {}).get('data', [])
+        wind_dir = variables.get('wind.direction.at-10m', {}).get('data', [])
         wave = variables.get('wave.height', {}).get('data', [])
+        tide_level = variables.get('tide.level', {}).get('data', [])
+        tide_dir = variables.get('tide.direction', {}).get('data', [])
         
         print(f"✓ Wind data points: {len(wind)}")
+        print(f"✓ Wind direction data points: {len(wind_dir)}")
         print(f"✓ Wave data points: {len(wave)}")
+        print(f"✓ Tide level data points: {len(tide_level)}")
+        print(f"✓ Tide direction data points: {len(tide_dir)}")
 
         if not wind or not wave:
             print(f"❌ No data in arrays")
@@ -221,12 +237,88 @@ def fetch_marine_data(location_input, days=2):
             w_kts = wind[i] * 1.944  # m/s to knots
             wv_m = wave[i]
             
-            # Safety assessment
-            if w_kts > 25 or wv_m > 2.0:
+            # Get wind direction and tide info if available
+            w_dir = wind_dir[i] if i < len(wind_dir) else None
+            t_level = tide_level[i] if i < len(tide_level) else None
+            t_dir_raw = tide_dir[i] if i < len(tide_dir) else None
+            
+            # Detect wind vs tide opposition (creates steeper, choppier seas)
+            wind_opposes_tide = False
+            opposition_factor = 1.0
+            opposition_note = ""
+            
+            if w_dir is not None and t_dir_raw is not None:
+                # Handle tide direction (could be string like "FLOOD"/"EBB" or degrees)
+                try:
+                    # Map common tide directions to degrees (simplified)
+                    tide_deg_map = {
+                        "flood": 0, "flowing_in": 0, "in": 0,
+                        "ebb": 180, "flowing_out": 180, "out": 180,
+                        "north": 0, "south": 180, "east": 90, "west": 270
+                    }
+                    
+                    t_dir = None
+                    if isinstance(t_dir_raw, str):
+                        t_dir_str = str(t_dir_raw).lower()
+                        t_dir = tide_deg_map.get(t_dir_str, None)
+                    else:
+                        try:
+                            t_dir = float(t_dir_raw)
+                        except:
+                            pass
+                    
+                    if t_dir is not None:
+                        # Check if wind opposes tide (within 45 degrees of opposite directions)
+                        angle_diff = abs(float(w_dir) - t_dir)
+                        # Account for circular nature (e.g., 350 vs 10 = 20 degrees apart)
+                        if angle_diff > 180:
+                            angle_diff = 360 - angle_diff
+                        
+                        if angle_diff < 45 or angle_diff > 315:  # 0-45 or 315-360
+                            wind_opposes_tide = True
+                            opposition_factor = 1.4  # 40% increase in effective chop
+                            opposition_note = " ⚠️ Wind-tide opposition creates steep seas!"
+                except Exception as e:
+                    print(f"⚠️ Could not parse tide direction: {e}")
+            
+            # Effective wave height considering opposition
+            effective_wave = wv_m * opposition_factor
+            
+            # Boat-size adjusted thresholds
+            if boat_size < 6.0:
+                # Small boats (< 6m): conservative thresholds
+                danger_wind = 25
+                nogo_wind = 18
+                caution_wind = 14
+                danger_wave = 1.8
+                nogo_wave = 1.3
+                caution_wave = 0.8
+                boat_class = "SMALL"
+            elif boat_size < 9.0:
+                # Medium boats (6-9m): standard thresholds
+                danger_wind = 28
+                nogo_wind = 20
+                caution_wind = 15
+                danger_wave = 2.2
+                nogo_wave = 1.5
+                caution_wave = 1.0
+                boat_class = "MEDIUM"
+            else:
+                # Large boats (9m+): more tolerant thresholds
+                danger_wind = 32
+                nogo_wind = 24
+                caution_wind = 18
+                danger_wave = 2.5
+                nogo_wave = 1.8
+                caution_wave = 1.2
+                boat_class = "LARGE"
+            
+            # Safety assessment with boat-size specific thresholds
+            if w_kts > danger_wind or effective_wave > danger_wave:
                 flag = " 🔴 DANGER"
-            elif w_kts > 20 or wv_m > 1.5:
+            elif w_kts > nogo_wind or effective_wave > nogo_wave:
                 flag = " 🟠 NO-GO"
-            elif w_kts > 15 or wv_m > 1.0:
+            elif w_kts > caution_wind or effective_wave > caution_wave:
                 flag = " 🟡 CAUTION"
             else:
                 flag = " ✅ SAFE"
@@ -246,9 +338,22 @@ def fetch_marine_data(location_input, days=2):
                 # Fallback if no time available
                 time_display = f"T+{i*3}h"
             
-            report += f"[{time_display}] Wind: {w_kts:.0f}kt | Wave: {wv_m:.1f}m{flag}\n"
+            # Build forecast line with directional info if available
+            direction_str = ""
+            if w_dir is not None:
+                direction_str = f" {int(w_dir)}°"
+            
+            report += f"[{time_display}] Wind: {w_kts:.0f}kt{direction_str} | Wave: {wv_m:.1f}m (eff: {effective_wave:.1f}m){flag}"
+            if opposition_note:
+                report += opposition_note
+            report += "\n"
         
-        report += f"\n💡 Limits: Wind >20kt OR Wave >1.5m = NO-GO for small vessels"
+        report += f"\n📏 **Vessel Class: {boat_class}** ({boat_size:.1f}m)\n"
+        report += f"🚨 Safety Thresholds:\n"
+        report += f"   • DANGER: Wind >{danger_wind}kt or Wave >{danger_wave:.1f}m\n"
+        report += f"   • NO-GO: Wind >{nogo_wind}kt or Wave >{nogo_wave:.1f}m\n"
+        report += f"   • CAUTION: Wind >{caution_wind}kt or Wave >{caution_wave:.1f}m\n"
+        report += f"⚠️ **Wind opposing tide increases wave chop by 40%** (shown in 'eff:' value)"
         
         print(f"✅ SUCCESS - Returning report ({len(report)} chars)")
         print(f"{'='*60}\n")
