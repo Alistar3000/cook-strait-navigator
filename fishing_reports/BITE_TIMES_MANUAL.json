@@ -1,0 +1,36 @@
+{
+  "source": "https://www.fishing.net.nz/fishing-advice/bite-times/",
+  "instructions": "Visit the link above, take screenshots of bite times, and enter data manually here. Format: HH:MM - HH:MM",
+  "note": "Due to website blocking automated access, manual entry recommended. Once data is in this file, it becomes the reference source.",
+  "sample_date": "Thu 19-Feb-2026",
+  "sample_data": {
+    "major_bites": [
+      {
+        "time": "13:45 - 15:45",
+        "note": "Afternoon major bite window"
+      },
+      {
+        "time": "01:23 - 03:23",
+        "note": "Early morning major bite window"
+      }
+    ],
+    "minor_bites": [
+      {
+        "time": "05:20 - 08:20",
+        "note": "Morning minor bite"
+      },
+      {
+        "time": "18:01 - 21:01",
+        "note": "Evening minor bite"
+      }
+    ],
+    "sun": {
+      "rise": "06:55",
+      "set": "20:13"
+    },
+    "moon": {
+      "rise": "08:20",
+      "set": "21:01"
+    }
+  }
+}

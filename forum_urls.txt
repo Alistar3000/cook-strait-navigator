@@ -1,0 +1,16 @@
+# Forum URLs to scrape for fishing reports
+# Add the forum discussion thread URLs you want to scrape
+# One URL per line
+
+# Example formats:
+# https://www.fishing.net.nz/forum/viewtopic.php?t=12345
+# https://www.boatingnz.com/forum/discussion/fishing-reports/
+# https://example-forum.com/threads/wellington-fishing/
+
+# Add your forum URLs below:
+ https://www.fishing.net.nz/forum/wellington-boat-fishing_topic63514.html
+ https://www.fishing.net.nz/fishing-reports/saltwater-fishing-reports/
+ https://www.petelambfishing.co.nz/Petes-Articles-about-fishing-in-Wellington
+https://www.nzfishingworld.co.nz/reports-regions/wellington-kapiti
+
+

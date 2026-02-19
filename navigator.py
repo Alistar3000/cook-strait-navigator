@@ -1,0 +1,858 @@
+import os
+import requests
+import urllib3
+import warnings
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+from duckduckgo_search import DDGS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain.agents import Tool, create_react_agent, AgentExecutor
+from langchain_core.prompts import PromptTemplate
+# Import bite times API
+try:
+    from bite_times_api import get_bite_times_for_agent
+except ImportError:
+    # Fallback if bite_times_api not available
+    def get_bite_times_for_agent(location="wellington", days=3):
+        return "Bite times API not available. Check https://www.fishing.net.nz/fishing-advice/bite-times/"
+# Suppress warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+load_dotenv()
+
+# --- 1. COMPREHENSIVE LOCATION DATABASE ---
+LOCATIONS = {
+    # Wellington / North Island Side
+    "mana marina": {"lat": -41.10108, "lon": 174.86700},
+    "mana": {"lat": -41.1141, "lon": 174.8512},
+    "plimmerton": {"lat": -41.0821, "lon": 174.8615},
+    "pukerua bay": {"lat": -41.0312, "lon": 174.8945},
+    "titahi bay": {"lat": -41.1023, "lon": 174.8312},
+    "makara": {"lat": -41.2245, "lon": 174.7123},
+    "karori rock": {"lat": -41.3482, "lon": 174.6523},
+    "terawhiti": {"lat": -41.2912, "lon": 174.6154},
+    "sinclair head": {"lat": -41.3610, "lon": 174.7670},
+    "barrett reef": {"lat": -41.3520, "lon": 174.8350},
+    
+    # Cook Strait Center / Hazards
+    "cook strait": {"lat": -41.2000, "lon": 174.5500},
+    "78m rise": {"lat": -41.2000, "lon": 174.5500},
+    "fishermans rock": {"lat": -41.0672, "lon": 174.6015},
+    "hunter bank": {"lat": -40.9671, "lon": 174.8172},
+    "awash rock": {"lat": -41.1415, "lon": 174.3750},
+    "cook rock": {"lat": -41.0330, "lon": 174.4670},
+    
+    # Marlborough Sounds / South Island Side
+    "tory channel": {"lat": -41.2145, "lon": 174.3212},
+    "tory": {"lat": -41.2145, "lon": 174.3212},  # Short form
+    "cape koamaru": {"lat": -41.0883, "lon": 174.3814},
+    "koamaru": {"lat": -41.0883, "lon": 174.3814},  # Short form
+    "brothers islands": {"lat": -41.1020, "lon": 174.4410},
+    "ship cove": {"lat": -41.0950, "lon": 174.2420},
+    "motuara island": {"lat": -41.0500, "lon": 174.2700},
+    "perano head": {"lat": -41.1830, "lon": 174.3160}
+}
+
+def fetch_marine_data(location_input, days=2):
+    """MetOcean v2 fetcher with DETAILED error logging.
+    
+    Args:
+        location_input: Location name or query
+        days: Number of days to forecast (default 2, max 10)
+    """
+    print(f"\n{'='*60}")
+    print(f"🔍 FETCH_MARINE_DATA CALLED")
+    print(f"Input: '{location_input}'")
+    print(f"Days: {days}")
+    print(f"{'='*60}")
+    
+    try:
+        api_key = os.getenv("METOCEAN_API_KEY")
+        print(f"API Key present: {bool(api_key)}")
+        
+        if not api_key:
+            return "❌ ERROR: METOCEAN_API_KEY not found"
+        
+        query = str(location_input).lower().strip()
+        print(f"Cleaned query: '{query}'")
+        
+        # Limit days to reasonable range (marine forecasts beyond 10 days are unreliable)
+        days = max(1, min(int(days), 10))
+        
+        # "The Sounds" DETECTION AND ENTRANCE RECOGNITION
+        coords = None
+        location_name = query
+        
+        # First, check if user is specifying an entrance directly (even without "sounds" keyword)
+        # This handles follow-up answers like "Tory Channel", "Tory", "Koamaru", or "Cape Koamaru"
+        has_tory = any(word in query for word in ["tory", "eastern", "east entrance", "east", "tory channel"])
+        has_koamaru = any(word in query for word in ["koamaru", "northern", "north entrance", "northwest", "north", "cape koamaru"])
+        
+        # If it's just an entrance name without location context, treat it as that entrance
+        if has_tory and not coords:
+            coords = LOCATIONS["tory channel"]
+            location_name = "Tory Channel (Eastern Entrance)"
+            print(f"✓ Detected entrance: Tory Channel")
+        elif has_koamaru and not coords:
+            coords = LOCATIONS["cape koamaru"]
+            location_name = "Cape Koamaru (Northern Entrance)"
+            print(f"✓ Detected entrance: Cape Koamaru")
+        
+        # If user mentions "sounds" or "marlborough" but hasn't specified entrance, ask for clarification
+        if not coords and ("sounds" in query or "marlborough" in query):
+            return ("⚠️ CLARIFICATION NEEDED:\n\n"
+                   "The Marlborough Sounds has TWO main entrances:\n\n"
+                   "1️⃣ TORY CHANNEL (Eastern) - or just say \"Tory\"\n"
+                   "2️⃣ CAPE KOAMARU (Northern) - or just say \"Koamaru\"\n\n"
+                   "❓ Which entrance will you use?")
+        
+        # Location lookup
+        if not coords:
+            clean_query = query.replace(" ", "")
+            print(f"Looking up: '{clean_query}'")
+            
+            if clean_query in LOCATIONS:
+                coords = LOCATIONS[clean_query]
+                location_name = query.title()
+                print(f"✓ Exact match found")
+            else:
+                for key, val in LOCATIONS.items():
+                    if key in query or query in key:
+                        coords = val
+                        location_name = key.title()
+                        print(f"✓ Partial match: {key}")
+                        break
+            
+            if not coords:
+                coords = LOCATIONS["cook strait"]
+                location_name = "Cook Strait (Central)"
+                print(f"⚠ Using fallback")
+        
+        print(f"📍 Location: {location_name}")
+        print(f"📍 Coords: {coords}")
+        
+        now_dt = datetime.now()
+        print(f"⏰ Time: {now_dt}")
+        
+        # API PARAMETERS
+        params = {
+            "lat": coords['lat'],
+            "lon": coords['lon'],
+            "variables": "wind.speed.at-10m,wave.height",
+            "from": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": (now_dt + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        }
+        
+        print(f"🌐 API Params: {params}")
+        
+        url = "https://forecast-v2.metoceanapi.com/point/time"
+        print(f"🌐 Calling API...")
+        
+        r = requests.get(url, params=params, headers={"x-api-key": api_key}, verify=False, timeout=15)
+        
+        print(f"📡 Response Status: {r.status_code}")
+        print(f"📡 Response Length: {len(r.text)} chars")
+        
+        if r.status_code != 200:
+            error_text = r.text[:300]
+            print(f"❌ API Error: {error_text}")
+            return (f"⚠️ Weather API error {r.status_code}.\n"
+                   f"Error: {error_text}\n\n"
+                   f"Use WebConsensus to check weather sites.")
+        
+        data = r.json()
+        print(f"✓ JSON parsed successfully")
+        print(f"✓ Data type: {type(data)}")
+        print(f"✓ Keys: {list(data.keys()) if isinstance(data, dict) else 'NOT A DICT'}")
+        
+                
+        if not isinstance(data, dict):
+            return "⚠️ Invalid data format."
+
+        variables = data.get('variables', {})
+        time_dim = data.get('dimensions', {}).get('time', {})
+        
+        # FIXED: Handle times - could be dict with 'data' key or a list
+        if isinstance(time_dim, dict):
+            times = time_dim.get('data', [])
+        else:
+            times = time_dim if isinstance(time_dim, list) else []
+        
+        print(f"✓ Variables: {list(variables.keys())}")
+        print(f"✓ Time dimension type: {type(time_dim)}")
+        print(f"✓ Time points: {len(times)}")
+        if times:
+            print(f"✓ First time: {times[0]}")
+        
+        wind = variables.get('wind.speed.at-10m', {}).get('data', [])
+        wave = variables.get('wave.height', {}).get('data', [])
+        
+        print(f"✓ Wind data points: {len(wind)}")
+        print(f"✓ Wave data points: {len(wave)}")
+
+        if not wind or not wave:
+            print(f"❌ No data in arrays")
+            return f"⚠️ No forecast data for {location_name}."
+        
+        print(f"✓ Building report...")
+        
+        # Build report
+        report = f"═══ {location_name.upper()} ═══\n"
+        report += f"📍 {coords['lat']:.3f}°S, {coords['lon']:.3f}°E\n"
+        report += f"📅 Forecast: {days} day(s)\n\n"
+        
+        # Determine max entries based on days requested
+        # Show more data for multi-day analysis
+        if days <= 2:
+            max_display = 16
+        elif days <= 4:
+            max_display = 32
+        elif days <= 7:
+            max_display = 56  # ~8 per day
+        else:
+            max_display = 80  # ~8 per day for up to 10 days
+        
+        max_entries = min(len(wind), len(wave), max_display)
+        print(f"✓ Reporting {max_entries} entries")
+        
+        for i in range(max_entries):
+            w_kts = wind[i] * 1.944  # m/s to knots
+            wv_m = wave[i]
+            
+            # Safety assessment
+            if w_kts > 25 or wv_m > 2.0:
+                flag = " 🔴 DANGER"
+            elif w_kts > 20 or wv_m > 1.5:
+                flag = " 🟠 NO-GO"
+            elif w_kts > 15 or wv_m > 1.0:
+                flag = " 🟡 CAUTION"
+            else:
+                flag = " ✅ SAFE"
+            
+            # FIXED: Time formatting - handle list index properly
+            if i < len(times):
+                time_str = times[i]
+                try:
+                    if isinstance(time_str, str):
+                        dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                        time_display = dt.strftime('%a %d %H:%M')
+                    else:
+                        time_display = str(time_str)[:16]
+                except:
+                    time_display = f"T+{i*3}h"
+            else:
+                # Fallback if no time available
+                time_display = f"T+{i*3}h"
+            
+            report += f"[{time_display}] Wind: {w_kts:.0f}kt | Wave: {wv_m:.1f}m{flag}\n"
+        
+        report += f"\n💡 Limits: Wind >20kt OR Wave >1.5m = NO-GO for small vessels"
+        
+        print(f"✅ SUCCESS - Returning report ({len(report)} chars)")
+        print(f"{'='*60}\n")
+        return report
+        
+    except requests.exceptions.Timeout as e:
+        print(f"❌ TIMEOUT: {e}")
+        return "⚠️ API timeout. Use WebConsensus."
+    except Exception as e:
+        print(f"❌ EXCEPTION TYPE: {type(e).__name__}")
+        print(f"❌ EXCEPTION: {e}")
+        print(f"❌ EXCEPTION STR: '{str(e)}'")
+        import traceback
+        traceback.print_exc()
+        return f"⚠️ Error: {type(e).__name__}: {str(e)}\n\nUse WebConsensus tool."
+
+def marine_web_search(query):
+    """Web search - simplified."""
+    return ("💡 Manual weather check recommended:\n\n"
+           "🌐 **Windy.com**: https://www.windy.com\n"
+           "🌐 **PredictWind**: https://www.predictwind.com/forecast/map\n"
+           "🌐 **MetService Marine**: https://www.metservice.com/marine/regions/cook-strait\n"
+           "🌐 **Yr.no**: https://www.yr.no/en")
+
+def fetch_weather_wrapper(input_str):
+    """Wrapper that handles location and optional days parameter.
+    
+    Accepts:
+    - "location" (defaults to 2 days)
+    - "location, days" (e.g., "mana marina, 7" for 7-day forecast)
+    
+    Validates requests and caps at 10 days (marine forecast reliability limit).
+    """
+    parts = [p.strip() for p in str(input_str).split(',')]
+    location = parts[0]
+    days = 2  # default
+    requested_days = None
+    
+    if len(parts) > 1:
+        try:
+            requested_days = int(parts[1])
+            days = requested_days
+        except ValueError:
+            pass  # keep default
+    
+    # If user requested more than 10 days, inform them of the limit
+    if requested_days and requested_days > 10:
+        result = fetch_marine_data(location, 10)  # Get 10-day forecast
+        return (f"⚠️ **Note:** You requested a {requested_days}-day forecast, but marine weather forecasts "
+                f"beyond 10 days are generally unreliable due to rapidly changing conditions. "
+                f"Showing 10-day forecast instead.\n\n{result}")
+    
+    return fetch_marine_data(location, days)
+
+def search_books(query):
+    """Search maritime PDFs for hazards and local knowledge."""
+    try:
+        vector_db = Chroma(persist_directory="./chroma_db", embedding_function=OpenAIEmbeddings())
+        # Filter for maritime category if available
+        docs = vector_db.similarity_search(query, k=3, filter={"category": "maritime"})
+        
+        # Fallback if no category filter results
+        if not docs:
+            docs = vector_db.similarity_search(query, k=3)
+        
+        if not docs:
+            return "No local hazard information found."
+        
+        result = "═══ LOCAL MARITIME KNOWLEDGE ═══\n\n"
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get('source', 'Unknown')
+            page = doc.metadata.get('page', '?')
+            content = doc.page_content[:300].strip()
+            result += f"📖 {source} (p.{page})\n{content}...\n\n"
+        
+        return result
+    except Exception as e:
+        return "⚠️ Knowledge base unavailable."
+
+def search_fishing_reports(query):
+    """Search fishing reports for species, techniques, conditions, and local fishing knowledge."""
+    try:
+        vector_db = Chroma(persist_directory="./chroma_db", embedding_function=OpenAIEmbeddings())
+        # Search for fishing reports
+        docs = vector_db.similarity_search(query, k=4, filter={"category": "fishing_reports"})
+        
+        # Fallback without filter if database doesn't have categories yet
+        if not docs:
+            docs = vector_db.similarity_search(query + " fishing", k=4)
+        
+        if not docs:
+            return "No fishing reports found. Add fishing reports to the fishing_reports folder and run ingest_knowledge.py"
+        
+        result = "═══ FISHING REPORTS ═══\n\n"
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get('filename', doc.metadata.get('source', 'Unknown'))
+            content = doc.page_content[:400].strip()
+            result += f"🎣 {source}\n{content}...\n\n"
+        
+        return result
+    except Exception as e:
+        return "⚠️ Fishing reports unavailable. Run ingest_knowledge.py to add fishing data."
+
+def fetch_bite_times_wrapper(days_input):
+    """Fetch bite times from fishing.net.nz for fishing recommendations"""
+    try:
+        # Parse input - might be just days or "location, days"
+        days = 3  # default
+        
+        if 'day' in days_input.lower():
+            # Try to extract number
+            import re
+            match = re.search(r'(\d+)', days_input)
+            if match:
+                days = min(int(match.group(1)), 14)  # Max 14 days
+        
+        return get_bite_times_for_agent(location="wellington", days=days)
+    except Exception as e:
+        return f"⚠️ Bite times currently unavailable. Visit https://www.fishing.net.nz/fishing-advice/bite-times/ for live data. Error: {str(e)}"
+
+def get_updated_executor():
+    """Create agent with smart journey planning for both crossings and local trips."""
+    now = datetime.now()
+    current_time_str = now.strftime("%A, %B %d, %Y, %H:%M NZDT")
+    
+    template = """You are Cook Strait Navigator - expert marine safety advisor for New Zealand waters.
+
+Current Time: {current_time_str}
+🧠 CONTEXT AWARENESS:
+- If the query is just an entrance name ("Tory", "Koamaru", etc.), this is a follow-up answer to your previous entrance clarification question
+- Treat it as: "I want a Cook Strait crossing forecast to [entrance name]"
+- Proceed immediately with weather checks for that entrance
+� RESPONSE FORMAT (CRITICAL):
+You MUST follow this exact format:
+- Thought: [describe what you're thinking or what you'll do next]
+- Action: [tool name]
+- Action Input: [input for the tool]
+- Observation: [result from tool - this comes automatically]
+- Thought: [analyze the observation]
+- Action: [next tool] OR Final Answer: [if done]
+
+When providing your final answer:
+1. Write your last Thought on one line
+2. Press enter to create a NEW LINE
+3. Write "Final Answer:" on that new line
+4. Write your formatted response
+
+CORRECT FORMAT:
+Thought: I have all the data needed to answer.
+
+Final Answer:
+
+[Your response here]
+
+WRONG FORMAT (causes errors):
+Thought:Final Answer: [response]  ← NO! Missing line break!
+
+�🚨 CRITICAL SAFETY RULES:
+1. Wind > 20kt OR Wave > 1.5m = NO-GO for recreational vessels
+2. ALWAYS consider return conditions - even day trips need safe return timing before weather deteriorates
+3. Watch for wind changes, spring tides against wind, and deteriorating trends
+4. For day trips: Provide specific "return by" times when conditions will worsen
+5. For multi-day forecasts, identify BEST and WORST days
+6. DEFAULT DEPARTURE: If no departure location specified for crossings, assume "mana marina" (-41.10108°S, 174.86700°E)
+
+📋 THREE TYPES OF QUERIES:
+
+**TYPE 1: LOCAL TRIPS** (fishing, day trips from one location)
+Workflow:
+1. Check weather at the location
+2. Check LocalKnowledge for hazards (especially tide information)
+3. Analyze 48hr forecast for:
+   - Best weather windows (low wind, calm seas)
+   - Weather changes (wind shifts, building seas)
+   - **RETURN timing**: When conditions deteriorate during the day
+   - Tide considerations (if mentioned in hazards) - watch for tide running against wind
+   - Safe return windows before wind builds or conditions worsen
+4. Recommend BEST days/times with SPECIFIC RETURN ADVICE
+5. Warn if conditions change rapidly (e.g., "depart 8am, return by 2pm before northerlies build")
+
+**CRITICAL for day trips**: Always analyze the FULL day pattern and provide safe return timing, not just departure conditions!
+
+**TYPE 2: COOK STRAIT CROSSINGS** (to Marlborough Sounds, across strait)
+‼️ SPECIAL RULES:
+   → If query is ONLY an entrance name ("Tory", "Koamaru", etc.) with NO other context:
+      • Treat this as answering a previous entrance clarification question
+      • Proceed immediately with full crossing forecast to that entrance
+      • Use "mana marina" as departure
+   
+   → If query mentions "Marlborough Sounds" or "the Sounds" WITHOUT specifying entrance:
+      • IMMEDIATELY ask "Which entrance: Tory Channel (Eastern) or Cape Koamaru (Northern)?" 
+      • DO NOT check weather APIs until entrance is specified!
+      • RECOGNIZE short answers: "Tory", "Tory Channel", "Koamaru", "Cape Koamaru", "Eastern", "Northern" are all valid
+
+Workflow (once entrance is known):
+1. If no departure specified in query, use "mana marina" as default
+2. Check departure location weather
+3. Check Cook Strait central weather
+4. Check specific entrance weather (tory channel OR cape koamaru)
+5. Check destination hazards
+6. Analyze outbound AND return conditions
+7. Calculate safe return window before deterioration
+
+**TYPE 3: BEST TIME ANALYSIS** (finding optimal windows over multiple days)
+Examples: "When's the best time to go to the Sounds in the next week?" or "Which day is best for fishing at Pukerua Bay in the next 5 days?"
+
+Workflow:
+1. Determine timeframe from query (week = 7 days, 3 days, 5 days, 10 days, etc. - MAX 10 days)
+2. For Cook Strait crossings: Check if entrance needs clarification FIRST (see TYPE 2 rule above)
+3. Fetch extended forecast using days parameter in WeatherTideAPI (e.g., "location, 7" for 7 days)
+4. Analyze ALL periods to find BEST weather windows
+5. Identify TOP 3 recommended times with specific departure windows
+6. Flag any NO-GO periods
+7. Provide clear recommendation with best day/time choices
+
+Note: Marine forecasts beyond 10 days are unreliable - if user asks for more, use 10 days and mention the limitation.
+
+**TYPE 4: FISHING RECOMMENDATIONS** (location suggestions based on weather + fishing reports)
+Examples: "Where should I go fishing on Wednesday?" or "Best fishing spot for this weekend based on conditions?"
+
+Workflow:
+1. Fetch weather forecast for the requested timeframe using WeatherTideAPI with extended days parameter
+2. Identify the best weather day(s) considering:
+   - Wind speed and direction
+   - Wave height
+   - Tide timing (from forecast output)
+3. Use FishingReports tool to search for locations that match the predicted conditions:
+   - Query with weather pattern (e.g., "light northerlies ebbing tide", "calm southerly slack water")
+   - Query with target species if mentioned by user
+4. Combine weather analysis + fishing report recommendations:
+   - State the best day with specific weather conditions
+   - Suggest location(s) based on fishing report patterns
+   - Include tide timing from forecast
+   - **PROVIDE SAFE RETURN TIME** before conditions deteriorate
+   - Mention target species and techniques from fishing reports
+
+Example response structure:
+"Next Wednesday is looking good, with light 8-12kt northerlies and 0.5m waves. There's an ebbing tide starting around 11am. Based on previous fishing reports, Pukerua Bay is productive in these conditions for snapper and kahawai. Soft baits and stray-lining work well there. Be sure to return by 3pm when the wind is forecast to shift southwest and build to 18kt."
+
+🎯 ANALYSIS CHECKLIST:
+- Identify ✅ SAFE periods (wind <15kt, wave <1m)
+- Identify 🟡 CAUTION periods (wind 15-20kt, wave 1-1.5m)
+- Identify 🟠 NO-GO periods (wind >20kt, wave >1.5m)
+- Note weather TRENDS (improving vs deteriorating)
+- Flag wind DIRECTION changes (may affect exposed areas)
+- Warn about RAPID changes (e.g., "conditions worsen after 10am")
+- **FOR DAY TRIPS**: Analyze FULL DAY pattern and specify safe return times
+- **TIDE WARNING**: Note if tide running against wind could create steep seas
+- Calculate "return by" times before conditions deteriorate
+
+⚠️ CRITICAL RULES:
+- NEVER use placeholder text like "[location]" or "[departure location]" in Action Input. ALWAYS use actual location names from the query or defaults.
+- IF query mentions "Marlborough Sounds" or "the Sounds" WITHOUT specifying an entrance, immediately ask which entrance BEFORE making any API calls
+- RECOGNIZE entrance answers: Accept "Tory Channel", "Tory", "Cape Koamaru", "Koamaru", "Eastern", "Northern" as valid entrance specifications
+- When user responds with ONLY an entrance name (e.g., "Tory" or "Koamaru" with no other context), this means:
+  * They are answering your entrance clarification question
+  * You should proceed with a full Cook Strait crossing forecast to that entrance
+  * Use default departure "mana marina"
+  * Check all three locations: departure, cook strait, and the specified entrance
+- For "best time" queries, extract the timeframe from the query and use extended forecast format:
+  * "next 3 days" → "location, 3"
+  * "this week" or "next week" → "location, 7"
+  * "next 10 days" → "location, 10"
+  * Maximum is 10 days (marine forecasts beyond this are unreliable)
+- For fishing queries requesting location recommendations, use FishingReports tool to match weather patterns with historical fishing success:
+  * First check weather forecast for the target day(s)
+  * Then query FishingReports with the weather conditions (e.g., "light northerlies ebbing tide")
+  * Combine weather + fishing reports to suggest specific locations with species/techniques
+  * Always include safe return timing before conditions deteriorate
+- When you finish gathering all data, write a final "Thought:" describing what you learned, then ON THE NEXT LINE write "Final Answer:" followed by your complete formatted response
+- The words "Final Answer:" MUST be on their own line, NEVER on the same line as "Thought:"
+- Format: "Thought: [your final thought]\nFinal Answer:\n\n[your response]"
+
+Available tools:
+{tools}
+
+Tool names: {tool_names}
+
+RESPONSE FORMATS:
+
+**For ENTRANCE-ONLY QUERY (follow-up answer):**
+Example: User previously asked about "the Sounds" and you asked which entrance. Now they reply:
+Question: Koamaru
+Thought: This is just an entrance name with no other context. The user is answering my previous question about which entrance to use. I should proceed with a Cook Strait crossing forecast to Cape Koamaru from the default departure (mana marina).
+Action: WeatherTideAPI
+Action Input: mana marina
+[... continue with full crossing workflow: departure → cook strait → koamaru → hazards → final answer ...]
+
+---
+
+**For LOCAL TRIPS:**
+Example: "What's the weather like for fishing at Plimmerton this weekend?"
+Question: {input}
+Thought: This is a local trip from Plimmerton. I need to check weather and hazards there, then analyze FULL DAY patterns including return timing.
+Action: WeatherTideAPI
+Action Input: plimmerton
+Observation: [48hr forecast]
+Thought: Looking at the forecast, I can see [day 1 pattern: calm morning but wind builds afternoon], [day 2 pattern]. I need to identify safe departure AND return windows. Let me check for local hazards and tide information.
+Action: LocalKnowledge
+Action Input: plimmerton
+Observation: [hazards]
+Thought: Now I have all the data. For Saturday: excellent conditions 8am-12pm, but wind builds to 18kt by 3pm so must return by 1pm. For Sunday: moderate all day. I can provide specific departure and return advice for each option.
+
+Final Answer:
+
+**🎣 FISHING FORECAST: [Location]**
+
+**BEST DAYS/TIMES:**
+✅ **[Day & Date], Depart [Time]**
+   - Wind: [X]kt | Wave: [X]m - Excellent conditions
+   - ⚓ **Return by [Time]**: Conditions remain good until [time/reason]
+   
+✅ **[Day & Date], Depart [Time]**
+   - Wind: [X]kt | Wave: [X]m - Good conditions
+   - ⚠️ **Return by [Time]**: Wind builds to [X]kt after this
+
+**AVOID:**
+🟠 **[Day & Time]**: Wind [X]kt, Wave [X]m - [Reason]
+
+**WEATHER PATTERN:**
+- [Describe overall trend, e.g., "Calm Friday morning, building northerlies Friday afternoon"]
+- [Note any changes, e.g., "Wind shifts to southerly Saturday bringing chop"]
+- [Any tide vs wind warnings, e.g., "Spring tide running against southerlies creates steep seas"]
+
+**LOCAL HAZARDS:**
+- [List relevant hazards from knowledge base, especially tide-related]
+
+**RECOMMENDATION:** 
+[Summary with best option including specific return timing. Example: "Best option is Friday 8am-1pm. Depart early, return by 1pm before northerlies build to 18kt in afternoon."]
+
+---
+
+**For FISHING RECOMMENDATIONS (location suggestion based on weather + reports):**
+Example: "Where should I go fishing on Wednesday?" or "Best fishing spot this weekend based on conditions?"
+Question: {input}
+Thought: This is a fishing recommendation query. I need to first check the weather forecast for the specified day(s), then search fishing reports to match locations with those conditions.
+Action: WeatherTideAPI
+Action Input: mana marina, 5
+Observation: [multi-day forecast showing Wednesday has light 8-12kt northerlies, 0.5m waves, ebbing tide from 11am]
+Thought: Wednesday looks excellent with light northerlies and calm seas. Now I'll search fishing reports to find which locations are productive in these conditions.
+Action: FishingReports
+Action Input: light northerlies ebbing tide
+Observation: [fishing reports showing Pukerua Bay produces well in light northerlies with ebbing tide for snapper and kahawai, soft baits effective]
+Thought: Perfect! I have weather conditions and matching fishing location data. I can now provide a complete recommendation with specific timing and safe return window.
+
+Final Answer:
+
+**🎣 FISHING RECOMMENDATION**
+
+**BEST DAY: Wednesday [Date]**
+
+**CONDITIONS:**
+- Wind: 8-12kt northerlies  
+- Waves: 0.5m - Excellent
+- Tide: Ebbing from 11am
+
+**RECOMMENDED LOCATION: Pukerua Bay**
+Based on previous fishing reports, Pukerua Bay is highly productive in these conditions:
+- **Target Species**: Snapper, kahawai, gurnard
+- **Techniques**: Soft baits and stray-lining work well  
+- **Best Time**: Fish the ebbing tide from 11am-2pm
+
+**TIMING:**
+- ✅ **Depart**: 10am (set up before tide turns)
+- ⚓ **Return by**: 3pm - Wind forecast to shift southwest and build to 18kt later afternoon
+
+**ALTERNATIVE:** Thursday also looks reasonable but with slightly stronger winds (12-15kt southerlies).
+
+**SAFETY NOTE:** Monitor wind shifts. If southerlies arrive earlier than forecast, return immediately as this location is exposed to southerly chop.
+
+---
+
+**For CROSSINGS (with Sounds entrance clarification):**
+Example: "Can I cross to the Marlborough Sounds this weekend?"
+Question: {input}
+Thought: The user wants to go to the Marlborough Sounds but hasn't specified which entrance. I need to ask for clarification BEFORE checking any weather data.
+
+Final Answer:
+
+⚠️ **CLARIFICATION NEEDED**
+
+The Marlborough Sounds has TWO main entrances:
+
+1️⃣ **TORY CHANNEL** (Eastern Entrance)
+   - More direct route from Wellington
+   - Popular for Picton access
+   - Just reply with "Tory" or "Tory Channel"
+
+2️⃣ **CAPE KOAMARU** (Northern Entrance)  
+   - Access to Queen Charlotte Sound
+   - More exposed to northerlies
+   - Just reply with "Koamaru" or "Cape Koamaru"
+
+❓ **Which entrance will you be using?**
+
+Once you specify, I can provide a detailed crossing forecast including departure times, weather conditions, and return windows.
+
+---
+
+**For CROSSINGS (after entrance is specified):**
+Example: User first asked "Can I go to the Sounds?" and then replied "Koamaru"
+Question: Koamaru
+Thought: The user has specified Cape Koamaru as their entrance choice. This is a follow-up answer to my entrance clarification question. I should now proceed with checking weather for a Cook Strait crossing to Cape Koamaru. Using default departure "mana marina".
+Action: WeatherTideAPI
+Action Input: mana marina
+Observation: [forecast data]
+Thought: Got departure forecast. Now checking Cook Strait central.
+Action: WeatherTideAPI
+Action Input: cook strait
+Observation: [forecast data]
+Thought: Got Cook Strait forecast. Now checking Cape Koamaru destination.
+Action: WeatherTideAPI
+Action Input: koamaru
+Observation: [forecast data]
+Thought: Got destination forecast. Now checking local hazards.
+Action: LocalKnowledge
+Action Input: cape koamaru
+Observation: [hazards]
+Thought: I now have all the data to provide a complete crossing forecast from Mana Marina to Cape Koamaru.
+
+Final Answer:
+
+**⚓ STRAIT CROSSING: Mana Marina → Cape Koamaru**
+[... full crossing recommendation with outbound/return analysis ...]
+
+---
+
+**For CROSSINGS (entrance specified in original query):**
+
+**For BEST TIME ANALYSIS (multi-day):**
+Example 1: "When's the best time to go fishing at Pukerua Bay over the next week?"
+Question: {input}
+Thought: This is a best-time analysis query for 7 days at Pukerua Bay. I need to fetch an extended forecast to identify the optimal windows including safe return timing.
+Action: WeatherTideAPI
+Action Input: pukerua bay, 7
+Observation: [7-day forecast with many time periods]
+Thought: I have 7 days of data. Analyzing all periods to find the best fishing conditions. For each good window, I need to identify when conditions deteriorate so I can specify safe return times. Let me also check for local hazards and tide information.
+Action: LocalKnowledge
+Action Input: pukerua bay
+Observation: [hazards]
+Thought: I've analyzed the full week forecast. Best option is Friday 7am-1pm (return by 1pm before wind builds to 18kt). Second best is Sunday morning with all-day good conditions. Third is Wednesday but watch afternoon sea breeze.
+
+Final Answer:
+
+**🎣 BEST FISHING TIMES: Pukerua Bay (Next 7 Days)**
+
+**TOP RECOMMENDATIONS:**
+🥇 **BEST: [Day] [Date], Depart [Time]**
+   - Wind: [X]kt | Wave: [X]m
+   - Conditions: [Description]
+   - ⚓ **Return by [Time]**: [Reason, e.g., "Wind builds to 20kt after 2pm"]
+
+🥈 **GOOD: [Day] [Date], Depart [Time]**  
+   - Wind: [X]kt | Wave: [X]m
+   - Conditions: [Description]
+   - ⚓ **Return by [Time]**: [Reason]
+
+🥉 **FAIR: [Day] [Date], Depart [Time]**
+   - Wind: [X]kt | Wave: [X]m  
+   - Conditions: [Description]
+   - ⚠️ **Return by [Time]**: [Reason]
+
+**AVOID:**
+🟠 **[Days/Times]**: [Conditions] - [Reason]
+
+**WEEKLY PATTERN:**
+- [Describe overall weather trend across the week]
+- [Note any significant changes and when to avoid being on water]
+
+**LOCAL HAZARDS:**
+- [Relevant hazards, especially tide-related]
+
+**RECOMMENDATION:** [Pick the absolute best option]
+
+---
+
+Example 2: "What's the best day in the next 5 days to cross to Tory Channel?"
+Question: {input}
+Thought: This is a best-time analysis for a 5-day Cook Strait crossing to Tory Channel. I need to check 5-day forecasts for departure, Cook Strait, and Tory Channel.
+Action: WeatherTideAPI
+Action Input: mana marina, 5
+Observation: [5-day forecast]
+Thought: Got 5 days of departure data. Now checking Cook Strait.
+Action: WeatherTideAPI
+Action Input: cook strait, 5
+Observation: [5-day forecast]
+Thought: Got 5 days of Cook Strait data. Now checking Tory Channel.
+Action: WeatherTideAPI
+Action Input: tory channel, 5
+Observation: [5-day forecast]
+Thought: Have all 5-day forecasts. Analyzing to find the best crossing window with safe conditions throughout the route.
+
+Final Answer:
+
+**⚓ BEST CROSSING WINDOWS: Mana Marina → Tory Channel (Next 5 Days)**
+
+**TOP RECOMMENDATIONS:**
+🥇 **BEST: [Day] [Date], Depart [Time]**
+   - All locations show excellent conditions
+   - Safe return window: [Hours]
+   
+🥈 **GOOD: [Day] [Date], Depart [Time]**
+   - Good conditions, minor caution on return
+   
+🥉 **FAIR: [Day] [Date], Depart [Time]**
+   - Acceptable but watch [specific concern]
+
+**5-DAY PATTERN:**
+- [Describe trend]
+
+**RECOMMENDATION:** [Best specific option]
+
+**LOCAL HAZARDS:**
+- [Relevant hazards]
+
+**RECOMMENDATION:** [Pick the absolute best option]
+
+---
+
+**For CROSSINGS (with known entrance):**
+Example: "Can I cross to Tory Channel tomorrow?"
+Question: {input}  
+Thought: This is a Cook Strait crossing to Tory Channel. The entrance is specified, so I can proceed. User hasn't specified departure, so I'll use default "mana marina". I need to check departure, Cook Strait, destination weather, then hazards.
+Action: WeatherTideAPI
+Action Input: mana marina
+Observation: [forecast]
+Thought: Got departure forecast. Now checking Cook Strait central.
+Action: WeatherTideAPI  
+Action Input: cook strait
+Observation: [forecast]
+Thought: Got Cook Strait forecast. Now checking Tory Channel destination.
+Action: WeatherTideAPI
+Action Input: tory channel
+Observation: [forecast]
+Thought: Got destination forecast. Now checking local hazards.
+Action: LocalKnowledge
+Action Input: tory channel
+Observation: [hazards]
+Thought: Perfect. I now have all the data: departure conditions, Cook Strait conditions, destination conditions, and local hazards. I can analyze everything and provide a complete crossing recommendation.
+
+Final Answer:
+
+**⚓ STRAIT CROSSING: [Departure] → [Destination]**
+
+**RECOMMENDATION: [GO/NO-GO]**
+
+**OUTBOUND:** 
+- Depart: [Time window]
+- [Departure]: [conditions]
+- Cook Strait: [conditions]
+- [Destination]: [conditions]
+
+**RETURN:**
+⚠️ **CRITICAL:** Return by [time] - conditions deteriorate to [X]kt/[X]m after this
+- [Describe deterioration pattern]
+
+**HAZARDS:**
+- [List from knowledge base]
+
+**FINAL ADVICE:** [Clear recommendation with timing]
+
+Question: {input}
+{agent_scratchpad}"""
+
+    prompt = PromptTemplate.from_template(template).partial(current_time_str=current_time_str)
+    
+    tools = [
+        Tool(
+            name="WeatherTideAPI", 
+            func=fetch_weather_wrapper, 
+            description="Get marine weather forecast with wind/wave data and safety flags (✅SAFE/🟡CAUTION/🟠NO-GO). Input format: 'location' for 2-day forecast OR 'location, days' for custom forecasts (e.g., 'mana marina, 7' for 7 days, 'pukerua bay, 5' for 5 days). Maximum 10 days (marine forecasts beyond this are unreliable). Use extended forecasts for 'best time' analysis queries. Locations: mana marina, cook strait, tory channel, cape koamaru, plimmerton, pukerua bay, etc."
+        ),
+        Tool(
+            name="WebConsensus", 
+            func=marine_web_search, 
+            description="Get links to Windy, PredictWind, MetService. Use for supplemental cross-checking."
+        ),
+        Tool(
+            name="LocalKnowledge", 
+            func=search_books, 
+            description="Search maritime PDFs for rocks, rips, tide considerations, and local hazards. Essential for understanding area-specific dangers. Input: location name"
+        ),
+        Tool(
+            name="FishingReports", 
+            func=search_fishing_reports, 
+            description="Search historical fishing reports for species, techniques, best conditions (wind/tide/time), and successful locations. Use when users ask about fishing or want location recommendations based on weather patterns. Input: query about species, location, or conditions (e.g., 'snapper light northerlies', 'Pukerua Bay', 'blue cod ebbing tide')"
+        ),
+        Tool(
+            name="BiteTimesAPI",
+            func=fetch_bite_times_wrapper,
+            description="Fetch real-time bite times from fishing.net.nz for major and minor feeding windows. Includes sun/moon rise-set times. Use for fishing recommendations to tell users when fish are most active. Input: 'X days' to fetch bite times (e.g., 'next 3 days', 'next 7 days'). References Māori fishing calendar and scientific bite time data."
+        )
+    ]
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    agent = create_react_agent(llm, tools, prompt)
+    
+    return AgentExecutor(
+        agent=agent, 
+        tools=tools, 
+        verbose=True, 
+        handle_parsing_errors=True,
+        max_iterations=15,
+        max_execution_time=90
+    )
+
+agent = get_updated_executor()
